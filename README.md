@@ -6,7 +6,7 @@
 
 <p align="center">
   <a href="https://pypi.org/project/transformer-toolkit/"><img src="https://img.shields.io/pypi/v/transformer-toolkit?color=cyan&style=flat-square" alt="PyPI version"/></a>
-  <a href="https://pypi.org/project/transformer-toolkit/"><img src="https://img.shields.io/pypi/dm/transformer-toolkit?color=blueviolet&style=flat-square" alt="Downloads"/></a>
+  <a href="https://pypi.org/project/transformer-toolkit/"><img src="https://static.pepy.tech/badge/transformer-toolkit" alt="Downloads"/></a>
   <a href="https://github.com/Barbade22/transformer-toolkit/blob/main/LICENSE"><img src="https://img.shields.io/github/license/Barbade22/transformer-toolkit?style=flat-square" alt="License"/></a>
 </p>
 
