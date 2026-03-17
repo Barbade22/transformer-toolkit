@@ -4,12 +4,12 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name            = "transformer-toolkit"
-version         = "0.0.23"
+version         = "0.0.24"
 description     = "Minimal, modular transformer library for training your own LLM"
 readme          = "README.md"
 license         = { file = "LICENSE" }
 requires-python = ">=3.10"
-authors         = [{ name = "Govind Barbade" }]
+authors         = [{ name = "Govind Barbade", email="govindbarbade5@gmail.com" }]
 keywords        = ["transformer", "llm", "deep learning", "nlp", "pytorch"]
 classifiers     = [
     "Development Status :: 3 - Alpha",
@@ -35,8 +35,8 @@ hf         = ["transformers>=4.35.0",
 all        = ["transformer-toolkit[tokenizers,hf]"]
 
 [project.urls]
-Homepage   = "https://github.com/govindbarbade/transformer-toolkit"
-Repository = "https://github.com/govindbarbade/transformer-toolkit"
+Homepage   = "https://github.com/Barbade22/transformer-toolkit"
+Repository = "https://github.com/Barbade22/transformer-toolkit"
 
 [tool.setuptools.packages.find]
 where   = ["."]
