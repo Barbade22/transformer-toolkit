@@ -1,0 +1,11 @@
+# .gitignore
+__pycache__/
+*.pyc
+*.egg-info/
+dist/
+build/
+.env
+*.pth
+*.bin
+*.bat
+release.py
