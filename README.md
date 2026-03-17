@@ -1,13 +1,13 @@
-# transformer-toolkit
+# Transformer-Toolkit
 
 <p align="center">
-  <img src="images/image/Gemini_Generated_Image_xp00mzxp00mzxp00.png" alt="Transformer Toolkit Logo" width="600"/>
+  <img src="images/image.png" alt="Transformer Toolkit Logo" width="600"/>
 </p>
 
 <p align="center">
   <a href="https://pypi.org/project/transformer-toolkit/"><img src="https://img.shields.io/pypi/v/transformer-toolkit?color=cyan&style=flat-square" alt="PyPI version"/></a>
   <a href="https://pypi.org/project/transformer-toolkit/"><img src="https://img.shields.io/pypi/dm/transformer-toolkit?color=blueviolet&style=flat-square" alt="Downloads"/></a>
-  <a href="https://github.com/YOUR_USERNAME/transformer-toolkit/blob/main/LICENSE"><img src="https://img.shields.io/github/license/YOUR_USERNAME/transformer-toolkit?style=flat-square" alt="License"/></a>
+  <a href="https://github.com/Barbade22/transformer-toolkit/blob/main/LICENSE"><img src="https://img.shields.io/github/license/Barbade22/transformer-toolkit?style=flat-square" alt="License"/></a>
 </p>
 
 
@@ -866,4 +866,4 @@ pip install transformer-toolkit tokenizers transformers datasets huggingface_hub
 
 ## License
 
-MIT
+This project is licensed under the Apache 2.0 License - see the [LICENSE](LICENSE) file for details.
