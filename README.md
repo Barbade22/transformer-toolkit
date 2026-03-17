@@ -1,7 +1,7 @@
 # Transformer-Toolkit
 
 <p align="center">
-  <img src="images/image.png" alt="Transformer Toolkit Logo" width="600"/>
+  <img src="https://raw.githubusercontent.com/Barbade22/transformer-toolkit/main/images/image.png" alt="Transformer Toolkit Logo" width="600"/>
 </p>
 
 <p align="center">
