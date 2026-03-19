@@ -138,86 +138,12 @@ cfg_train = TrainConfig(
 )
 
 
-# trainer = SFTTrainer(
-#     model      = model,
-#     train_dl   = train_dl,
-#     val_dl     = val_dl,
-#     vocab_size = tok.vocab_size,
-#     cfg        = cfg_train,
-#     tokenizer  = tok,
-# )
-# trainer.train()
-
-def chat(
-    prompt:      str,
-    system:      str   = None,
-    max_new:     int   = 200,
-    temperature: float = 0.8,
-    top_k:       int   = 50,
-) -> str:
-    """
-    Generate a response using the trained model.
-
-    Uses the same ChatTemplate as training so the model sees the exact token
-    sequences it was trained on. Appends the assistant header to prime generation
-    and stops at the first end-of-turn token if present in the decoded output.
-
-    Args:
-        prompt      : user message
-        system      : optional system prompt (prepended if provided)
-        max_new     : maximum new tokens to generate
-        temperature : sampling temperature (lower = more deterministic)
-        top_k       : top-k sampling (1 = greedy)
-
-    Returns:
-        decoded response string (assistant turn only)
-    """
-    tpl  = template   # reuse the same template used during training
-
-    msgs = []
-    if system:
-        msgs.append({"role": "system", "content": system})
-    msgs.append({"role": "user", "content": prompt})
-
-    # format all turns, then append the assistant header to prime generation
-    full_text, _ = tpl.format_messages(msgs)
-    primed       = full_text + tpl.assistant_header
-
-    ids = tok.encode(primed)
-    x   = torch.tensor([ids], dtype=torch.long).to(DEVICE)
-    out = model.generate(x, max_new=max_new, temperature=temperature, top_k=top_k)
-
-    new_ids  = out[0][len(ids):].tolist()
-    response = tok.decode(new_ids)
-
-    # strip trailing end-of-turn markers if the model emits them
-    for eos_marker in ("<|im_end|>", "<|eot_id|>", "</s>"):
-        if eos_marker in response:
-            response = response[:response.index(eos_marker)]
-
-    return response.strip()
-
-
-# Single-turn example:
-print(chat("What is the capital of France?"))
-
-# With system prompt:
-print(chat(
-    prompt = "How do I reverse a string in Python?",
-    system = "You are a concise coding assistant. Answer in 1-2 sentences.",
-))
-
-# Multi-turn (manual history management — model is stateless):
-history = []
-while True:
-    user_input = input("You: ").strip()
-    if not user_input: break
-    history.append({"role": "user", "content": user_input})
-    full, _ = template.format_messages(history)
-    primed  = full + template.assistant_header
-    ids     = tok.encode(primed)
-    x       = torch.tensor([ids[-cfg_model.max_seq:]], dtype=torch.long).to(DEVICE)
-    out     = model.generate(x, max_new=200, temperature=0.8, top_k=50)
-    reply   = tok.decode(out[0][len(ids):].tolist()).split("<|im_end|>")[0].strip()
-    history.append({"role": "assistant", "content": reply})
-    print(f"Assistant: {reply}\n")
+trainer = SFTTrainer(
+    model      = model,
+    train_dl   = train_dl,
+    val_dl     = val_dl,
+    vocab_size = tok.vocab_size,
+    cfg        = cfg_train,
+    tokenizer  = tok,
+)
+trainer.train()

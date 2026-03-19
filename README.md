@@ -45,6 +45,15 @@ pip install transformer-toolkit
 - [Trainer](#trainer)
   - [TrainConfig](#trainconfig)
   - [Training Loop](#training-loop)
+- [Supervised Fine-Tuning (SFT)](#supervised-fine-tuning-sft)
+  - [How it works](#how-it-works)
+  - [Chat templates](#chat-templates)
+  - [Data formats](#data-formats)
+  - [SFT data loading](#sft-data-loading)
+  - [SFT training](#sft-training)
+  - [Loading and inference](#loading-and-inference)
+  - [Debug output](#debug-output)
+  - [Common issues](#common-issues)
 - [HuggingFace Hub](#huggingface-hub)
 - [Generation](#generation)
 - [Full Examples](#full-examples)
@@ -96,7 +105,6 @@ trainer.train()
 ### TransformerConfig
 
 All architecture decisions live in one dataclass. Pass it to `Transformer()`.
-
 ```python
 from transformer_toolkit.model import TransformerConfig
 
@@ -110,15 +118,19 @@ cfg = TransformerConfig(
 
     # ── attention ─────────────────────────────────────────────────────
     attn       = "gqa",      # "mha" | "gqa" | "mqa" | "flash" | "mla"
-    n_kv_heads = 4,          # gqa only — number of key/value heads
+    n_kv_heads = 4,          # gqa only — n_heads must be divisible by n_kv_heads
     latent_dim = 64,         # mla only — latent compression dimension
 
     # ── feed-forward ──────────────────────────────────────────────────
-    ffn        = "swiglu",   # "ffn" | "swiglu" | "moe"
+    ffn        = "swiglu",   # "ffn" | "relu_ffn" | "glu" | "reglu" | "geglu"
+                             # | "swiglu" | "moe" | "moe_ec" | "moe_shared"
     hidden_dim = 2048,       # FFN inner dimension (default: dim × 4)
-    n_experts  = 8,          # moe only — number of experts
-    top_k      = 2,          # moe only — experts activated per token
-    moe_aux_weight = 0.01,   # moe load-balancing loss coefficient
+    n_experts  = 8,          # moe / moe_ec / moe_shared — total experts
+    top_k      = 2,          # moe / moe_shared — experts activated per token
+    moe_aux_weight = 0.01,   # moe / moe_shared — load-balancing loss coefficient
+    moe_capacity   = 1.0,    # moe_ec — capacity factor
+    moe_n_shared   = 2,      # moe_shared — always-active experts
+    moe_n_routed   = 6,      # moe_shared — sparse routed experts
 
     # ── normalization ─────────────────────────────────────────────────
     norm       = "rmsnorm",  # "rmsnorm" | "layernorm"
@@ -128,11 +140,12 @@ cfg = TransformerConfig(
     pos_enc    = "rope",     # "rope" | "sinusoidal" | "learned" | "alibi" | "none"
 
     # ── regularisation ────────────────────────────────────────────────
-    dropout    = 0.1,
+    dropout    = 0.0,        # 0.0 recommended for SFT and inference
 
     # ── output ────────────────────────────────────────────────────────
-    tie_weights = False,     # share embedding and output projection weights
-                             # see Weight Tying section before enabling
+    tie_weights = True,      # share embedding and output projection weights
+                             # recommended — halves vocab params, better for small models
+                             # see Weight Tying section before disabling
 )
 ```
 
@@ -604,6 +617,431 @@ Training output:
 If val loss is still above 8.0 at step 300, something is wrong with initialization. If it drops below 1.0 before step 1000 on a small dataset, you are overfitting.
 
 ---
+
+# Supervised Fine-Tuning (SFT)
+
+Transformer Toolkit supports full SFT training on top of a pretrained model.
+The pipeline handles data formatting, loss masking, multi-turn conversations,
+and inference — all with the same tokenizer used during pretraining.
+
+---
+
+## How it works
+
+During pretraining the model learns language from raw text with no special structure.
+SFT teaches it to follow a specific conversation format — roles, turns, and how to stop.
+
+The key idea is the **loss mask**. Not all tokens contribute to the loss:
+
+```
+<|start_header_id|>user<|end_header_id|>        → loss=0  (model sees this as context)
+What is Python?<|eot_id|>                        → loss=0
+<|start_header_id|>assistant<|end_header_id|>   → loss=0  (header primes generation)
+
+Python is a programming language.<|eot_id|>     → loss=1  (model learns this)
+[EOS]                                            → loss=1  (model learns to stop)
+```
+
+The model only trains on what it needs to *generate* — assistant content, the turn-closing
+token, and EOS. Everything else is context.
+
+---
+
+## Tokenizer
+
+All special tokens must be registered **before pretraining**. The vocabulary is frozen
+after pretraining — tokens cannot be added at SFT time.
+
+`RustBPETokenizer` registers all required tokens automatically at train time:
+
+```python
+from transformer_toolkit import RustBPETokenizer
+
+tok = RustBPETokenizer()
+
+with open("corpus.txt", encoding="utf-8") as f:
+    lines = [l.strip() for l in f if l.strip()]
+
+tok.train(texts=lines, vocab_size=32_000)
+tok.save("tokenizer.json")
+```
+
+Fixed special token IDs (always at these positions regardless of vocab size):
+
+| ID | Token | Used for |
+|----|-------|----------|
+| 0  | `[UNK]` | unknown token |
+| 1  | `[PAD]` | padding |
+| 2  | `[BOS]` | beginning of sequence |
+| 3  | `[EOS]` | end of sequence |
+| 4  | `[SEP]` | separator |
+| 5  | `[MASK]` | masked token |
+| 6  | `[CLS]` | classification |
+| 7  | `<\|im_start\|>` | ChatML turn start |
+| 8  | `<\|im_end\|>` | ChatML turn end |
+| 9  | `<\|start_header_id\|>` | LLaMA3 header start |
+| 10 | `<\|end_header_id\|>` | LLaMA3 header end |
+| 11 | `<\|eot_id\|>` | LLaMA3 end of turn |
+| 12 | `<start_of_turn>` | Gemma turn start |
+| 13 | `<end_of_turn>` | Gemma turn end |
+| 14 | `<\|tool_call\|>` | tool use |
+| 15 | `<\|tool_result\|>` | tool result |
+| 16 | `<\|doc_start\|>` | document boundary |
+| 17 | `<\|doc_end\|>` | document boundary |
+| 18 | `<\|code_start\|>` | code block |
+| 19 | `<\|code_end\|>` | code block |
+| 20 | `<\|system\|>` | system prompt |
+
+---
+
+## Chat templates
+
+A `ChatTemplate` defines how conversations are formatted into a string.
+Pick one template and use it consistently across SFT and inference.
+
+```python
+from transformer_toolkit import ChatTemplate
+
+template = ChatTemplate("llama3")   # or "chatml", "gemma", "alpaca", "raw"
+```
+
+### Available presets
+
+| Preset | Format | Special tokens |
+|--------|--------|----------------|
+| `llama3` | `<\|start_header_id\|>role<\|end_header_id\|>\n\ncontent<\|eot_id\|>` | IDs 9, 10, 11 |
+| `chatml` | `<\|im_start\|>role<\|im_end\|>\ncontent<\|im_end\|>\n` | IDs 7, 8 |
+| `gemma` | `<start_of_turn>role<end_of_turn>\ncontent<end_of_turn>\n` | IDs 12, 13 |
+| `alpaca` | `### Instruction:\ncontent\n\n### Response:\ncontent` | none |
+| `raw` | `User: content\nAssistant: content` | none |
+
+### Custom template
+
+```python
+template = ChatTemplate(
+    preset           = "chatml",          # base preset to inherit from
+    assistant_header = "<\|im_start\|>assistant\n",   # loss=0
+    assistant_closer = "<\|im_end\|>\n",              # loss=1
+)
+```
+
+---
+
+## Data formats
+
+Three schemas are supported and auto-detected:
+
+### messages (recommended for multi-turn)
+```json
+{
+  "messages": [
+    {"role": "system",    "content": "You are a helpful assistant."},
+    {"role": "user",      "content": "What is Python?"},
+    {"role": "assistant", "content": "Python is a programming language."},
+    {"role": "user",      "content": "How do I reverse a list?"},
+    {"role": "assistant", "content": "Use my_list[::-1]."}
+  ]
+}
+```
+
+### prompt_response (single-turn)
+```json
+{"prompt": "What is Python?", "response": "Python is a programming language."}
+```
+
+### instruction (Alpaca style)
+```json
+{"instruction": "Explain Python.", "input": "", "output": "Python is a programming language."}
+```
+
+All three can be mixed in the same dataset — schema is detected per sample.
+
+---
+
+## SFT data loading
+
+```python
+from transformer_toolkit import RustBPETokenizer, ChatTemplate
+from transformer_toolkit import SFTDataConfig, from_sft_strings
+
+tok = RustBPETokenizer()
+tok.load("tokenizer.json")
+
+cfg = SFTDataConfig(
+    tokenizer            = tok,       # auto-pulls bos_id, eos_id, pad_id
+    seq_len              = 512,       # must match model max_seq
+    batch_size           = 8,
+    split                = 0.9,       # 90% train, 10% val
+    template             = "llama3",  # must match what was used at pretrain time
+    schema               = "auto",    # auto-detect per sample
+    truncation_strategy  = "turn",    # drop whole turns instead of cutting mid-response
+    debug                = True,      # print sample debug info on first batch
+    debug_n              = 2,         # number of debug samples to show
+)
+
+# from a list of dicts in memory
+train_dl, val_dl = from_sft_strings(samples, tok, cfg)
+
+# from a local file
+from transformer_toolkit import from_sft_json
+train_dl, val_dl = from_sft_json("data.jsonl", tok, cfg)
+
+# from multiple files
+from transformer_toolkit import from_sft_files
+train_dl, val_dl = from_sft_files(["data1.jsonl", "data2.jsonl"], tok, cfg)
+
+# from HuggingFace
+from transformer_toolkit import from_sft_hf
+train_dl, val_dl = from_sft_hf("tatsu-lab/alpaca", tok, cfg)
+```
+
+### truncation_strategy
+
+| Value | Behaviour | Use when |
+|-------|-----------|----------|
+| `"token"` | Hard-truncate at `seq_len` | Single-turn SFT |
+| `"turn"` | Drop whole user+assistant pairs from the end | Multi-turn conversations |
+
+`"turn"` is always safer for conversations — it never leaves a partial assistant
+response with `loss=1` on incomplete text.
+
+---
+
+## SFT training
+
+```python
+from transformer_toolkit import Transformer, TransformerConfig
+from transformer_toolkit import SFTTrainer, TrainConfig
+import torch
+
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# load pretrained model
+cfg_model = TransformerConfig(
+    vocab_size  = tok.vocab_size,
+    dim         = 512,
+    n_layers    = 8,
+    n_heads     = 8,
+    n_kv_heads  = 2,          # GQA — n_heads must be divisible by n_kv_heads
+    attn        = "gqa",
+    ffn         = "swiglu",
+    hidden_dim  = 2048,
+    norm        = "rmsnorm",
+    pos_enc     = "rope",
+    dropout     = 0.0,        # typically 0 for SFT
+    tie_weights = True,       # recommended — halves embedding params
+    max_seq     = 512,        # must match SFTDataConfig seq_len
+)
+
+model = Transformer(cfg_model).to(DEVICE)
+
+# optionally load pretrained weights before SFT
+ckpt = torch.load("pretrain_checkpoints/best.pt", map_location=DEVICE)
+model.load_state_dict(ckpt["model"])
+
+cfg_train = TrainConfig(
+    max_steps        = 1000,
+    warmup_steps     = 50,
+    eval_every       = 100,
+    save_every       = 200,
+    log_every        = 25,
+    lr               = 1e-4,      # lower than pretraining — typically 1e-4 to 5e-5
+    min_lr           = 1e-5,
+    grad_accum_steps = 4,
+    mixed_precision  = True,
+    save_best        = True,
+    save_step_ckpts  = True,
+    ckpt_dir         = "sft_checkpoints",
+    hf_repo          = None,      # "username/model-name" to push to HF Hub
+)
+
+trainer = SFTTrainer(
+    model      = model,
+    train_dl   = train_dl,
+    val_dl     = val_dl,
+    vocab_size = tok.vocab_size,
+    cfg        = cfg_train,
+    tokenizer  = tok,
+)
+trainer.train()
+```
+
+### SFT vs pretraining hyperparameters
+
+| Parameter | Pretraining | SFT |
+|-----------|-------------|-----|
+| `lr` | `3e-4` | `1e-4` — `5e-5` |
+| `dropout` | `0.1` | `0.0` |
+| `warmup_steps` | `1000+` | `50` — `100` |
+| `grad_accum_steps` | `8+` | `4` |
+
+Lower learning rate for SFT — you are fine-tuning an existing model, not training from scratch.
+Too high an LR causes catastrophic forgetting of pretraining knowledge.
+
+---
+
+## Loading and inference
+
+```python
+from transformer_toolkit import RustBPETokenizer, ChatTemplate, Transformer, TransformerConfig
+import torch
+
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# load tokenizer
+tok = RustBPETokenizer()
+tok.load("tokenizer.json")
+
+# load model — same config as training
+cfg_model = TransformerConfig(...)
+model     = Transformer(cfg_model).to(DEVICE)
+
+# load SFT checkpoint — inference only, strip optimizer state
+ckpt = torch.load("sft_checkpoints/best.pt", map_location=DEVICE)
+model.load_state_dict(ckpt["model"])
+model.eval()
+
+# same template as training
+template = ChatTemplate("llama3")
+
+
+def chat(
+    prompt:      str,
+    system:      str   = None,
+    history:     list  = None,
+    max_new:     int   = 200,
+    temperature: float = 0.8,
+    top_k:       int   = 50,
+) -> str:
+    msgs = []
+    if system:
+        msgs.append({"role": "system", "content": system})
+    if history:
+        msgs.extend(history)
+    msgs.append({"role": "user", "content": prompt})
+
+    # format and append assistant header to prime generation
+    full_text, _ = template.format_messages(msgs)
+    primed       = full_text + template.assistant_header
+
+    ids = tok.encode(primed)
+    # truncate from left if too long — keep most recent context
+    if len(ids) > cfg_model.max_seq:
+        ids = ids[-cfg_model.max_seq:]
+
+    x = torch.tensor([ids], dtype=torch.long).to(DEVICE)
+    with torch.no_grad():
+        out = model.generate(x, max_new=max_new, temperature=temperature, top_k=top_k)
+
+    new_ids  = out[0][len(ids):].tolist()
+    response = tok.decode(new_ids, skip_special_tokens=False)
+
+    # strip end-of-turn marker
+    closer = template.assistant_closer.strip()
+    if closer and closer in response:
+        response = response[:response.index(closer)]
+
+    return response.strip()
+```
+
+### Single turn
+
+```python
+print(chat("What is the capital of France?"))
+```
+
+### With system prompt
+
+```python
+print(chat(
+    prompt = "How do I reverse a string in Python?",
+    system = "You are a concise coding assistant. Answer in 1-2 sentences.",
+))
+```
+
+### Multi-turn conversation
+
+```python
+history = []
+system  = "You are a helpful Python tutor."
+
+while True:
+    user_input = input("You: ").strip()
+    if not user_input:
+        break
+
+    reply = chat(
+        prompt      = user_input,
+        system      = system,
+        history     = history,
+        temperature = 0.8,
+        top_k       = 50,
+    )
+
+    # append to history for next turn
+    history.append({"role": "user",      "content": user_input})
+    history.append({"role": "assistant", "content": reply})
+
+    print(f"Assistant: {reply}\n")
+```
+
+### Saving an inference-only checkpoint
+
+The full training checkpoint includes optimizer state (~3× the model size).
+For deployment, strip it:
+
+```python
+# after training
+torch.save({"model": model.state_dict()}, "model_inference.pt")
+# full checkpoint:  ~500 MB  (model + Adam optimizer m/v buffers)
+# inference only:   ~170 MB  (model weights only)
+```
+
+---
+
+## Debug output
+
+Set `debug=True` in `SFTDataConfig` to inspect samples before training.
+The debug view shows the exact formatted text with color coding:
+
+```
+── formatted view ──
+<|start_header_id|>user<|end_header_id|>          ← cyan  (loss=0)
+What is Python?<|eot_id|>                          ← cyan  (loss=0)
+<|start_header_id|>assistant<|end_header_id|>     ← cyan  (loss=0)
+Python is a programming language.<|eot_id|>[EOS]  ← green (loss=1)
+```
+
+Sanity checks run automatically on each sample:
+
+- **zero response tokens** — schema or template mismatch
+- **alignment** — `y = x` shifted by 1 (catches dataset bugs)
+- **heavy padding** — suggests a smaller `seq_len`
+
+---
+
+## Common issues
+
+**`Template tokens [...] are fragmented`**
+The tokenizer was saved before the special tokens were registered.
+Retrain the tokenizer — vocabulary cannot be changed after pretraining.
+
+**`n_heads must be divisible by n_kv_heads`**
+GQA requires `n_heads % n_kv_heads == 0`.
+Example: `n_heads=6, n_kv_heads=3` ✓ — `n_heads=2, n_kv_heads=3` ✗
+
+**`seq_len` mismatch**
+`SFTDataConfig(seq_len=512)` and `TransformerConfig(max_seq=512)` must match exactly.
+
+**High padding warning**
+Your `seq_len` is much larger than your average sample length.
+Use `truncation_strategy="turn"` and lower `seq_len` to match your data.
+
+**Model not learning / loss not decreasing**
+Check `mask sum` in debug output — if response tokens are very few relative to
+total tokens, the model gets very little gradient signal per batch.
+Increase `batch_size` or `grad_accum_steps` to compensate.
+
 
 ## HuggingFace Hub
 
