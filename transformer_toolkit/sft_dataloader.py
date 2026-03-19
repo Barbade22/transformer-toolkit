@@ -15,7 +15,22 @@ Supports four data sources:
   - from_sft_files()   : list of .json / .jsonl file paths
 
 Each DataLoader yields (x, y, loss_mask) — loss_mask is 0 on prompt tokens,
-1 on response tokens. Pass all three to SFTTrainer.
+1 on response tokens + assistant_closer + EOS.
+
+Template / tokenizer contract
+──────────────────────────────
+All special tokens used by any ChatTemplate preset MUST be registered in the
+tokenizer's vocabulary at *pretrain* time (via RustBPETokenizer.train()).
+The vocabulary is frozen after pretraining — no tokens can be added at SFT time.
+
+Call tok.validate_template(cfg.template) once at SFT startup to assert this.
+
+Loss mask rules per assistant turn
+────────────────────────────────────
+  <|im_start|>assistant\n   →  loss=0  (header, model sees as context)
+  response content           →  loss=1
+  <|im_end|>\n               →  loss=1  (closer, model must learn to emit)
+  [EOS]                      →  loss=1  (sequence terminator)
 """
 
 import json
@@ -39,46 +54,73 @@ Schema = Literal["prompt_response", "messages", "instruction", "auto"]
 class ChatTemplate:
     """
     Formats a list of {"role": ..., "content": ...} messages into a single
-    string, and returns the character offset where the first assistant response
-    begins — so we can compute the loss mask precisely.
+    string, and returns the character spans where loss should be computed
+    (assistant content + closer + EOS).
 
-    Built-in templates: "chatml", "llama3", "alpaca", "raw"
-    Custom: pass your own format strings.
+    Built-in presets: "chatml", "llama3", "gemma", "alpaca", "raw"
+
+    Special token contract
+    ──────────────────────
+    Each preset declares which tokens must exist as *single* vocabulary entries
+    via its "special_tokens" list. These must all be registered at tokenizer
+    train time. Call tok.validate_template(template) at SFT startup to verify.
+
+    Loss mask per assistant turn
+    ─────────────────────────────
+      assistant_header   →  loss=0  (prompt boundary, model sees as context)
+      response content   →  loss=1
+      assistant_closer   →  loss=1  (model must learn to emit this to end turn)
+      eos_token          →  loss=1  (injected as string via format_messages())
 
     Usage:
         tpl = ChatTemplate("chatml")
-        text, response_start = tpl.format([
-            {"role": "user",      "content": "Hello"},
-            {"role": "assistant", "content": "Hi!"},
-        ])
+        text, spans = tpl.format_messages(messages, eos_token="[EOS]")
+        # spans = list of (start, end) char offsets, one per assistant turn
     """
 
     PRESETS = {
         "chatml": {
-            "system_fmt":    "<|im_start|>system\n{content}<|im_end|>\n",
-            "user_fmt":      "<|im_start|>user\n{content}<|im_end|>\n",
-            "assistant_fmt": "<|im_start|>assistant\n{content}<|im_end|>\n",
-            "assistant_header": "<|im_start|>assistant\n",
+            # tokens: <|im_start|> role \n  content  <|im_end|> \n
+            "system_fmt":       "<|im_start|>system\n{content}<|im_end|>\n",
+            "user_fmt":         "<|im_start|>user\n{content}<|im_end|>\n",
+            "assistant_fmt":    "<|im_start|>assistant\n{content}<|im_end|>\n",
+            "assistant_header": "<|im_start|>assistant\n",   # loss=0
+            "assistant_closer": "<|im_end|>\n",              # loss=1
+            # must be single tokens in the vocabulary
+            "special_tokens":   ["<|im_start|>", "<|im_end|>"],
         },
         "llama3": {
-            "system_fmt":    "<|start_header_id|>system<|end_header_id|>\n\n{content}<|eot_id|>",
-            "user_fmt":      "<|start_header_id|>user<|end_header_id|>\n\n{content}<|eot_id|>",
-            "assistant_fmt": "<|start_header_id|>assistant<|end_header_id|>\n\n{content}<|eot_id|>",
+            "system_fmt":       "<|start_header_id|>system<|end_header_id|>\n\n{content}<|eot_id|>",
+            "user_fmt":         "<|start_header_id|>user<|end_header_id|>\n\n{content}<|eot_id|>",
+            "assistant_fmt":    "<|start_header_id|>assistant<|end_header_id|>\n\n{content}<|eot_id|>",
             "assistant_header": "<|start_header_id|>assistant<|end_header_id|>\n\n",
+            "assistant_closer": "<|eot_id|>",
+            "special_tokens":   ["<|start_header_id|>", "<|end_header_id|>", "<|eot_id|>"],
+        },
+        "gemma": {
+            "system_fmt":       "<start_of_turn>system\n{content}<end_of_turn>\n",
+            "user_fmt":         "<start_of_turn>user\n{content}<end_of_turn>\n",
+            "assistant_fmt":    "<start_of_turn>model\n{content}<end_of_turn>\n",
+            "assistant_header": "<start_of_turn>model\n",
+            "assistant_closer": "<end_of_turn>\n",
+            "special_tokens":   ["<start_of_turn>", "<end_of_turn>"],
         },
         "alpaca": {
-            "system_fmt":    "### System:\n{content}\n\n",
-            "user_fmt":      "### Instruction:\n{content}\n\n",
-            "assistant_fmt": "### Response:\n{content}\n\n",
+            # plain-text markers — no special tokens needed
+            "system_fmt":       "### System:\n{content}\n\n",
+            "user_fmt":         "### Instruction:\n{content}\n\n",
+            "assistant_fmt":    "### Response:\n{content}\n\n",
             "assistant_header": "### Response:\n",
+            "assistant_closer": "\n",
+            "special_tokens":   [],
         },
         "raw": {
-            # No special tokens — just newline-separated turns.
-            # Useful for simple models trained from scratch.
-            "system_fmt":    "System: {content}\n",
-            "user_fmt":      "User: {content}\n",
-            "assistant_fmt": "Assistant: {content}\n",
+            "system_fmt":       "System: {content}\n",
+            "user_fmt":         "User: {content}\n",
+            "assistant_fmt":    "Assistant: {content}\n",
             "assistant_header": "Assistant: ",
+            "assistant_closer": "\n",
+            "special_tokens":   [],
         },
     }
 
@@ -89,47 +131,53 @@ class ChatTemplate:
         user_fmt:         str  = None,
         assistant_fmt:    str  = None,
         assistant_header: str  = None,
+        assistant_closer: str  = None,
+        special_tokens:   list = None,
     ):
         """
-        preset           : one of "chatml", "llama3", "alpaca", "raw"
-        system_fmt       : override system turn format (must contain {content})
+        preset           : one of "chatml", "llama3", "gemma", "alpaca", "raw"
+        system_fmt       : override system turn format  (must contain {content})
         user_fmt         : override user turn format
         assistant_fmt    : override assistant turn format
-        assistant_header : the prefix string before the assistant response text
-                           (used to locate where loss masking should end)
+        assistant_header : prefix before response content — gets loss=0
+        assistant_closer : suffix after response content — gets loss=1
+                           (model must learn to emit this to close the turn)
+        special_tokens   : list of strings that must be single vocab tokens
         """
         if preset not in self.PRESETS:
-            raise ValueError(f"Unknown preset {preset!r}. Choose from {list(self.PRESETS)}")
+            raise ValueError(
+                f"Unknown preset {preset!r}. "
+                f"Choose from {list(self.PRESETS)}"
+            )
         base = self.PRESETS[preset]
+        self.preset           = preset
         self.system_fmt       = system_fmt       or base["system_fmt"]
         self.user_fmt         = user_fmt         or base["user_fmt"]
         self.assistant_fmt    = assistant_fmt    or base["assistant_fmt"]
         self.assistant_header = assistant_header or base["assistant_header"]
+        self.assistant_closer = assistant_closer or base["assistant_closer"]
+        self.special_tokens   = special_tokens   if special_tokens is not None \
+                                                 else list(base["special_tokens"])
 
-    def format_single(self, prompt: str, response: str) -> tuple[str, int]:
-        """
-        Format a single prompt/response pair.
-        Returns (full_text, response_char_start).
-        """
-        header = self.user_fmt.format(content=prompt)
-        asst   = self.assistant_fmt.format(content=response)
-        text   = header + self.assistant_header
-        response_start = len(text)       # char offset where response tokens begin
-        text  += response
-        # close the assistant turn (everything after the response content)
-        suffix = self.assistant_fmt.format(content=response)
-        # suffix already contains the response; we just need the tail
-        tail   = suffix[len(self.assistant_header) + len(response):]
-        text  += tail
-        return text, response_start
+    # ── formatting ────────────────────────────────────────────────────────────
 
-    def format_messages(self, messages: list[dict]) -> tuple[str, list[tuple[int, int]]]:
+    def format_messages(
+        self,
+        messages:  list[dict],
+        eos_token: str = "",
+    ) -> tuple[str, list[tuple[int, int]]]:
         """
-        Format a multi-turn conversation.
+        Format a multi-turn conversation into a single string.
+
         Returns:
-            full_text           : the complete formatted string
-            response_spans      : list of (start, end) char offsets for each
-                                  assistant turn — only these positions get loss=1
+            full_text       : complete formatted string ready for tokenisation
+            response_spans  : list of (start, end) char offsets, one per
+                              assistant turn. Each span covers:
+                                  content + assistant_closer [+ eos_token]
+                              i.e. everything the model must learn to generate.
+
+        eos_token is appended as a *string* inside the span so that
+        _align_mask assigns it loss=1 correctly. Pass tokenizer.decode([eos_id]).
         """
         text           = ""
         response_spans = []
@@ -145,16 +193,32 @@ class ChatTemplate:
                 text += self.user_fmt.format(content=content)
 
             elif role == "assistant":
-                # record the span of the actual response text (not the header/footer)
-                prefix = text + self.assistant_header
-                start  = len(prefix)
-                full   = self.assistant_fmt.format(content=content)
-                tail   = full[len(self.assistant_header) + len(content):]
-                end    = start + len(content)
-                text   = prefix + content + tail
-                response_spans.append((start, end))
+                # ── loss=0 region ─────────────────────────────────────
+                header     = self.assistant_header
+                # ── loss=1 region ─────────────────────────────────────
+                closer     = self.assistant_closer
+                eos        = eos_token
+
+                span_start = len(text) + len(header)
+                span_end   = span_start + len(content) + len(closer) + len(eos)
+
+                text += header + content + closer + eos
+                response_spans.append((span_start, span_end))
 
         return text, response_spans
+
+    def format_single(self, prompt: str, response: str) -> tuple[str, int]:
+        """
+        Convenience wrapper for single-turn prompt/response pairs.
+        Returns (full_text, response_char_start).
+        Back-compat with any code that calls format_single directly.
+        """
+        msgs = [
+            {"role": "user",      "content": prompt},
+            {"role": "assistant", "content": response},
+        ]
+        text, spans = self.format_messages(msgs)
+        return text, spans[0][0]
 
 
 # ─── schema detection ─────────────────────────────────────────────────────────
@@ -175,7 +239,6 @@ def _detect_schema(sample: dict) -> Schema:
     if "instruction" in keys and ("output" in keys or "response" in keys):
         return "instruction"
 
-    # fallback hints
     if "input" in keys and "output" in keys:
         return "instruction"
 
@@ -189,26 +252,21 @@ def _normalise(sample: dict, schema: Schema) -> dict:
     """
     Normalise any supported schema into the canonical form:
         {"messages": [{"role": ..., "content": ...}, ...]}
-    Multi-turn messages pass through directly.
-    Single-turn schemas are wrapped into a 2-message list.
     """
     if schema == "auto":
         schema = _detect_schema(sample)
 
     if schema == "messages":
-        # support both "messages" and "conversations"/"conversation" keys
         msgs = (sample.get("messages")
                 or sample.get("conversation")
                 or sample.get("conversations")
                 or [])
-        # some datasets use "from"/"value" instead of "role"/"content"
         normalised = []
         for m in msgs:
             role    = m.get("role") or m.get("from", "user")
             content = m.get("content") or m.get("value", "")
-            # map "human" → "user", "gpt"/"model" → "assistant" (common HF conventions)
-            if role in ("human",):        role = "user"
-            if role in ("gpt", "model"):  role = "assistant"
+            if role in ("human",):       role = "user"
+            if role in ("gpt", "model"): role = "assistant"
             normalised.append({"role": role, "content": content})
         return {"messages": normalised}
 
@@ -231,16 +289,48 @@ def _normalise(sample: dict, schema: Schema) -> dict:
     raise ValueError(f"Unknown schema: {schema!r}")
 
 
-# ─── tokenisation with loss mask ──────────────────────────────────────────────
+# ─── turn-aware truncation ────────────────────────────────────────────────────
 
-def _encode_with_mask(
-    sample:    dict,
+def _truncate_to_turns(
+    messages:  list[dict],
     tokenizer: BaseTokenizer,
     template:  ChatTemplate,
     seq_len:   int,
-    schema:    Schema = "auto",
-    bos_id:    int    = None,
-    eos_id:    int    = None,
+    eos_token: str = "",
+) -> list[dict]:
+    """
+    Drop assistant+user turn pairs from the END of the conversation
+    until the encoded length fits within seq_len + 1.
+
+    Always keeps at least the first user + assistant pair so we never
+    return an empty or unlearnable sample.
+
+    Why: naive token truncation mid-assistant-turn leaves a partial response
+    with loss=1 on incomplete/garbage text. Dropping whole turns is always safer.
+    """
+    msgs = list(messages)
+    while len(msgs) > 2:
+        text, _ = template.format_messages(msgs, eos_token=eos_token)
+        ids     = tokenizer.encode(text)
+        if len(ids) <= seq_len + 1:
+            break
+        # drop the last user+assistant pair (keep at least first pair)
+        msgs = msgs[:-2]
+    return msgs
+
+
+# ─── tokenisation with loss mask ──────────────────────────────────────────────
+
+def _encode_with_mask(
+    sample:               dict,
+    tokenizer:            BaseTokenizer,
+    template:             ChatTemplate,
+    seq_len:              int,
+    schema:               Schema = "auto",
+    bos_id:               int    = None,
+    eos_id:               int    = None,
+    pad_id:               int    = 1,
+    truncation_strategy:  str    = "token",
 ) -> tuple[list[int], list[int]] | None:
     """
     Tokenise one sample and compute its loss mask.
@@ -248,40 +338,61 @@ def _encode_with_mask(
     Returns (token_ids, loss_mask) where both are lists of length <= seq_len+1,
     or None if the sample produces 0 response tokens (nothing to learn from).
 
-    loss_mask[i] = 1  →  token i is part of an assistant response (compute loss)
-    loss_mask[i] = 0  →  token i is a prompt / system / user token (ignore)
+    loss_mask[i] = 1  →  token i is part of an assistant response /
+                          closer / EOS  (compute loss here)
+    loss_mask[i] = 0  →  prompt / system / user / header token (ignore)
+
+    truncation_strategy:
+        "token" — hard-truncate at seq_len (fine for single-turn SFT)
+        "turn"  — drop whole turn pairs from the end until it fits
+                  (correct for multi-turn conversation training)
     """
     norm = _normalise(sample, schema)
     msgs = norm["messages"]
 
-    full_text, response_spans = template.format_messages(msgs)
+    # decode EOS id → string so the template embeds it inside the char span
+    # this ensures _align_mask assigns EOS loss=1 correctly
+    eos_token = ""
+    if eos_id is not None:
+        try:
+            eos_token = tokenizer.decode([eos_id])
+        except Exception:
+            eos_token = ""
 
-    # build a char-level mask first, then align to tokens
+    # ── truncation ────────────────────────────────────────────────────────────
+    if truncation_strategy == "turn":
+        msgs = _truncate_to_turns(msgs, tokenizer, template, seq_len, eos_token)
+
+    # ── format and build char-level mask ──────────────────────────────────────
+    full_text, response_spans = template.format_messages(msgs, eos_token=eos_token)
+
     char_mask = [0] * len(full_text)
     for start, end in response_spans:
         for i in range(start, min(end, len(full_text))):
             char_mask[i] = 1
 
-    # tokenise the full text
+    # ── tokenise ──────────────────────────────────────────────────────────────
+    # BOS prepended as a token only — not part of the formatted text,
+    # never included in any loss span.
+    # EOS is already embedded inside full_text by format_messages(), so we do
+    # NOT append it again here — that would double it.
     ids = tokenizer.encode(full_text)
-    if bos_id is not None: ids = [bos_id] + ids
-    if eos_id is not None: ids = ids + [eos_id]
+    if bos_id is not None:
+        ids = [bos_id] + ids
 
-    # align char mask to tokens via character-level byte offsets
-    # We re-tokenise prefix strings of increasing length to find boundaries.
-    # This is O(n²) but SFT datasets are small — acceptable.
+    # ── align char mask → token mask ──────────────────────────────────────────
     token_mask = _align_mask(full_text, char_mask, ids, tokenizer, bos_id)
 
-    # truncate to seq_len + 1 (we need +1 for the x/y shift)
-    max_len = seq_len + 1
+    # ── hard token truncation (always applied as a safety cap) ────────────────
+    max_len    = seq_len + 1
     ids        = ids[:max_len]
     token_mask = token_mask[:max_len]
 
-    # skip samples with no response tokens
+    # skip samples with no response tokens — nothing to learn from
     if sum(token_mask) == 0:
         return None
 
-    return ids, token_mask
+    return ids, token_mask, full_text, response_spans
 
 
 def _align_mask(
@@ -294,11 +405,12 @@ def _align_mask(
     """
     Map a character-level binary mask to a token-level binary mask.
 
-    Strategy: decode each token individually and use running character cursor.
-    Falls back to majority-vote if decode lengths don't align exactly.
+    Strategy: decode each token individually and use a running character cursor.
+    Majority vote: if >= 50% of the characters a token covers are in a response
+    span, the whole token gets loss=1.
     """
     token_mask = []
-    offset     = 0   # current char position in text
+    offset     = 0
 
     start_idx = 1 if bos_id is not None else 0
 
@@ -308,12 +420,10 @@ def _align_mask(
     for tok_id in token_ids[start_idx:]:
         tok_str = tokenizer.decode([tok_id])
         end     = offset + len(tok_str)
-        # majority vote: if more than half the characters this token covers
-        # are in a response span, label the whole token as response
-        span     = char_mask[offset:end]
-        vote     = sum(span) / max(len(span), 1)
+        span    = char_mask[offset:end]
+        vote    = sum(span) / max(len(span), 1)
         token_mask.append(1 if vote >= 0.5 else 0)
-        offset   = min(end, len(text))
+        offset  = min(end, len(text))
 
     return token_mask
 
@@ -327,29 +437,35 @@ class SFTDataset(Dataset):
     """
     def __init__(
         self,
-        samples:   list[dict],
-        tokenizer: BaseTokenizer,
-        template:  ChatTemplate,
-        seq_len:   int,
-        schema:    Schema = "auto",
-        bos_id:    int    = None,
-        eos_id:    int    = None,
+        samples:              list[dict],
+        tokenizer:            BaseTokenizer,
+        template:             ChatTemplate,
+        seq_len:              int,
+        schema:               Schema = "auto",
+        bos_id:               int    = None,
+        eos_id:               int    = None,
+        pad_id:               int    = 1,
+        truncation_strategy:  str    = "token",
     ):
         self.seq_len = seq_len
-        self.items   = []   # list of (ids, mask) pairs
+        self.pad_id  = pad_id
+        self.items   = []
 
         skipped = 0
         for i, sample in enumerate(samples):
             print(f"\r  {C.DIM}tokenizing{C.RESET}  {i+1}/{len(samples)}", end="", flush=True)
-            result = _encode_with_mask(sample, tokenizer, template, seq_len, schema, bos_id, eos_id)
+            result = _encode_with_mask(
+                sample, tokenizer, template, seq_len,
+                schema, bos_id, eos_id, pad_id, truncation_strategy,
+            )
             if result is None:
                 skipped += 1
                 continue
-            ids, mask = result
+            ids, mask, full_text, response_spans = result
             if len(ids) < 2:
                 skipped += 1
                 continue
-            self.items.append((ids, mask))
+            self.items.append((ids, mask, full_text, response_spans))
         print()
 
         if skipped:
@@ -361,13 +477,13 @@ class SFTDataset(Dataset):
         return len(self.items)
 
     def __getitem__(self, idx):
-        ids, mask = self.items[idx]
-        # pad or truncate to exactly seq_len + 1
+        ids, mask, full_text, response_spans = self.items[idx]
         target_len = self.seq_len + 1
+
         if len(ids) < target_len:
             pad_len = target_len - len(ids)
-            ids     = ids  + [0] * pad_len
-            mask    = mask + [0] * pad_len
+            ids     = ids  + [self.pad_id] * pad_len   # pad with pad_id, not 0
+            mask    = mask + [0]           * pad_len
 
         ids  = ids[:target_len]
         mask = mask[:target_len]
@@ -375,9 +491,9 @@ class SFTDataset(Dataset):
         ids_t  = torch.tensor(ids,  dtype=torch.long)
         mask_t = torch.tensor(mask, dtype=torch.float)
 
-        x          = ids_t[:-1]
-        y          = ids_t[1:]
-        loss_mask  = mask_t[1:]   # align mask with y (the targets)
+        x         = ids_t[:-1]
+        y         = ids_t[1:]
+        loss_mask = mask_t[1:]   # aligned with y (the targets)
 
         return x, y, loss_mask
 
@@ -389,39 +505,45 @@ class StreamingSFTDataset(IterableDataset):
     """
     def __init__(
         self,
-        source,            # iterable of dicts
-        tokenizer: BaseTokenizer,
-        template:  ChatTemplate,
-        seq_len:   int,
-        schema:    Schema = "auto",
-        bos_id:    int    = None,
-        eos_id:    int    = None,
+        source,
+        tokenizer:            BaseTokenizer,
+        template:             ChatTemplate,
+        seq_len:              int,
+        schema:               Schema = "auto",
+        bos_id:               int    = None,
+        eos_id:               int    = None,
+        pad_id:               int    = 1,
+        truncation_strategy:  str    = "token",
     ):
-        self.source    = source
-        self.tokenizer = tokenizer
-        self.template  = template
-        self.seq_len   = seq_len
-        self.schema    = schema
-        self.bos_id    = bos_id
-        self.eos_id    = eos_id
+        self.source               = source
+        self.tokenizer            = tokenizer
+        self.template             = template
+        self.seq_len              = seq_len
+        self.schema               = schema
+        self.bos_id               = bos_id
+        self.eos_id               = eos_id
+        self.pad_id               = pad_id
+        self.truncation_strategy  = truncation_strategy
 
     def __iter__(self):
         for sample in self.source:
             result = _encode_with_mask(
                 sample, self.tokenizer, self.template,
-                self.seq_len, self.schema, self.bos_id, self.eos_id
+                self.seq_len, self.schema,
+                self.bos_id, self.eos_id, self.pad_id,
+                self.truncation_strategy,
             )
             if result is None:
                 continue
-            ids, mask = result
+            ids, mask, full_text, response_spans = result
             if len(ids) < 2:
                 continue
 
             target_len = self.seq_len + 1
             if len(ids) < target_len:
                 pad_len = target_len - len(ids)
-                ids  = ids  + [0] * pad_len
-                mask = mask + [0] * pad_len
+                ids  = ids  + [self.pad_id] * pad_len
+                mask = mask + [0]           * pad_len
 
             ids  = ids[:target_len]
             mask = mask[:target_len]
@@ -435,37 +557,92 @@ class StreamingSFTDataset(IterableDataset):
 # ─── SFT DataConfig ───────────────────────────────────────────────────────────
 
 class SFTDataConfig:
+    """
+    Configuration for SFT data loading.
+
+    Pass tokenizer= to auto-pull bos_id / eos_id / pad_id.
+    Override individually if needed.
+
+    truncation_strategy:
+        "token" — hard-truncate at seq_len (default, fine for single-turn)
+        "turn"  — drop whole turn pairs from the end (correct for multi-turn
+                  conversation training — never truncates mid-assistant-turn)
+    """
     def __init__(
         self,
-        seq_len:     int   = 512,
-        batch_size:  int   = 8,
-        shuffle:     bool  = True,
-        num_workers: int   = 0,
-        split:       float = 0.9,
-        streaming:   bool  = False,
-        pin_memory:  bool  = True,
-        schema:      Schema = "auto",    # "auto" | "prompt_response" | "messages" | "instruction"
-        template:    str   = "chatml",   # ChatTemplate preset or ChatTemplate instance
-        bos_id:      int   = None,
-        eos_id:      int   = None,
-        debug:       bool  = False,
-        debug_n:     int   = 2,
+        tokenizer:            BaseTokenizer = None,
+        seq_len:              int    = 512,
+        batch_size:           int    = 8,
+        shuffle:              bool   = True,
+        num_workers:          int    = 0,
+        split:                float  = 0.9,
+        streaming:            bool   = False,
+        pin_memory:           bool   = True,
+        schema:               Schema = "auto",
+        template:             str    = "chatml",
+        bos_id:               int    = None,
+        eos_id:               int    = None,
+        pad_id:               int    = None,
+        truncation_strategy:  str    = "token",
+        debug:                bool   = False,
+        debug_n:              int    = 2,
     ):
-        self.seq_len     = seq_len
-        self.batch_size  = batch_size
-        self.shuffle     = shuffle
-        self.num_workers = num_workers
-        self.split       = split
-        self.streaming   = streaming
-        self.pin_memory  = pin_memory
-        self.schema      = schema
-        self.bos_id      = bos_id
-        self.eos_id      = eos_id
-        self.debug       = debug
-        self.debug_n     = debug_n
+        # auto-pull from tokenizer; manual overrides take priority
+        if tokenizer is not None:
+            self.bos_id = bos_id if bos_id is not None else getattr(tokenizer, "bos_id", None)
+            self.eos_id = eos_id if eos_id is not None else getattr(tokenizer, "eos_id", None)
+            self.pad_id = pad_id if pad_id is not None else getattr(tokenizer, "pad_id", 1)
+        else:
+            self.bos_id = bos_id
+            self.eos_id = eos_id
+            self.pad_id = pad_id if pad_id is not None else 1
+
+        self.seq_len              = seq_len
+        self.batch_size           = batch_size
+        self.shuffle              = shuffle
+        self.num_workers          = num_workers
+        self.split                = split
+        self.streaming            = streaming
+        self.pin_memory           = pin_memory
+        self.schema               = schema
+        self.truncation_strategy  = truncation_strategy
+        self.debug                = debug
+        self.debug_n              = debug_n
+
         # allow passing a pre-built ChatTemplate or just a preset name string
         self.template = (template if isinstance(template, ChatTemplate)
                          else ChatTemplate(template))
+
+        # validate template tokens exist in the tokenizer vocabulary
+        if tokenizer is not None:
+            _validate_template_tokens(tokenizer, self.template)
+
+
+def _validate_template_tokens(tokenizer: BaseTokenizer, template: ChatTemplate):
+    """
+    Assert that every special token the template uses encodes to exactly
+    one token ID. Raises RuntimeError if any are missing or fragmented.
+
+    This must be called at SFT startup — the vocabulary is frozen after
+    pretraining and these tokens cannot be added retroactively.
+    """
+    missing = []
+    for tok_str in template.special_tokens:
+        try:
+            ids = tokenizer.encode(tok_str)
+            if len(ids) != 1:
+                missing.append((tok_str, len(ids)))
+        except Exception as e:
+            missing.append((tok_str, str(e)))
+
+    if missing:
+        lines = "\n".join(f"  '{t}' → {n} tokens" for t, n in missing)
+        raise RuntimeError(
+            f"Template '{template.preset}' requires special tokens that are "
+            f"fragmented or missing in this vocabulary:\n{lines}\n"
+            f"All special tokens must be registered at tokenizer *pretrain* time.\n"
+            f"Vocabulary is frozen — cannot add tokens at SFT time."
+        )
 
 
 # ─── debug helper ─────────────────────────────────────────────────────────────
@@ -477,53 +654,53 @@ def _render_masked_text(
     max_chars: int = 480,
 ) -> str:
     """
-    Decode the full token sequence at once (so BPE joining works correctly),
-    then walk character offsets to assign prompt/response colors.
+    Decode the full token sequence and colorise by loss mask.
+    cyan  = prompt / header tokens  (loss=0)
+    green = response / closer / EOS (loss=1)
 
-    Prompt tokens   → cyan
-    Response tokens → green + bold
-
-    Strategy:
-      1. Decode full sequence → full_text  (correct, no inter-token spacing)
-      2. Decode prefix[0:i] for each boundary to find char offsets per token
-      3. Build a char-level mask, then group into contiguous colored segments
+    Decodes full sequence at once — the only correct approach since
+    the tokenizer decoder needs full context to restore spaces properly.
+    Char boundaries are built by decoding increasing prefixes once,
+    which is O(n) decode calls but done only in debug mode.
     """
     if not x_ids:
         return ""
 
-    # ── step 1: decode the full sequence properly ──────────────────────────
+    # decode full sequence at once for correct space restoration
     try:
         full_text = tokenizer.decode(x_ids)
     except Exception:
         full_text = "".join(f"[{t}]" for t in x_ids)
 
-    # ── step 2: find char boundary for each token via prefix decoding ──────
-    # decode prefix of length k to get cumulative char offset at token k
-    char_boundaries = [0]   # char_boundaries[k] = char offset after token k
+    if not full_text:
+        return ""
+
+    # build char boundaries via prefix decode
+    # O(n) calls but only runs in debug mode — acceptable
+    char_boundaries = [0]
     for k in range(1, len(x_ids) + 1):
         try:
-            prefix_text = tokenizer.decode(x_ids[:k])
-            char_boundaries.append(len(prefix_text))
+            char_boundaries.append(len(tokenizer.decode(x_ids[:k])))
         except Exception:
-            # fallback: estimate boundary from previous
             char_boundaries.append(char_boundaries[-1] + 1)
 
-    # ── step 3: build char-level mask ──────────────────────────────────────
+    # clamp boundaries to actual text length
+    char_boundaries = [min(b, len(full_text)) for b in char_boundaries]
+
+    # build char-level mask
     char_mask = [0] * len(full_text)
     for tok_idx, m in enumerate(mask):
         if tok_idx >= len(char_boundaries) - 1:
             break
-        start = char_boundaries[tok_idx]
-        end   = char_boundaries[tok_idx + 1]
         if m == 1:
-            for ci in range(start, min(end, len(full_text))):
+            for ci in range(char_boundaries[tok_idx],
+                            char_boundaries[tok_idx + 1]):
                 char_mask[ci] = 1
 
-    # ── step 4: group into contiguous segments and colorize ────────────────
+    # group into contiguous segments and colorise
     segments  = []
     cur_mask  = None
     cur_start = 0
-
     for ci, cm in enumerate(char_mask):
         if cm != cur_mask:
             if cur_mask is not None:
@@ -533,11 +710,9 @@ def _render_masked_text(
     if cur_mask is not None:
         segments.append((cur_mask, full_text[cur_start:]))
 
-    # ── step 5: build colored output, truncating at max_chars ──────────────
     result    = ""
     total_len = 0
     truncated = False
-
     for seg_mask, seg_text in segments:
         if total_len >= max_chars:
             truncated = True
@@ -546,31 +721,21 @@ def _render_masked_text(
         display   = seg_text[:remaining]
         if len(display) < len(seg_text):
             truncated = True
-
         if seg_mask == 1:
             result += f"{C.GREEN}{C.BOLD}{display}{C.RESET}"
         else:
             result += f"{C.CYAN}{display}{C.RESET}"
-
         total_len += len(display)
 
     if truncated:
         result += f"{C.DIM}…{C.RESET}"
-
     return result
 
 
 def _mask_bar(mask: list[int], width: int = 50) -> str:
-    """
-    Compact visual of the loss mask as a bar.
-    █ = response token (loss=1, green)
-    ░ = prompt token   (loss=0, dim)
-    Shows exact token positions at a glance.
-    """
     n      = len(mask)
     bar    = ""
     bucket = max(1, n // width)
-
     for i in range(0, n, bucket):
         chunk = mask[i: i + bucket]
         frac  = sum(chunk) / max(len(chunk), 1)
@@ -580,7 +745,6 @@ def _mask_bar(mask: list[int], width: int = 50) -> str:
             bar += f"{C.YELLOW}▒{C.RESET}"
         else:
             bar += f"{C.DIM}░{C.RESET}"
-
     legend = (f"  {C.GREEN}█{C.RESET}=response  "
               f"{C.YELLOW}▒{C.RESET}=mixed  "
               f"{C.DIM}░{C.RESET}=prompt")
@@ -588,10 +752,6 @@ def _mask_bar(mask: list[int], width: int = 50) -> str:
 
 
 def _find_turn_boundaries(mask: list[int]) -> list[tuple[int, int, int]]:
-    """
-    Find contiguous runs in the mask.
-    Returns list of (start_idx, end_idx, mask_value) for each run.
-    """
     if not mask:
         return []
     runs  = []
@@ -606,58 +766,54 @@ def _find_turn_boundaries(mask: list[int]) -> list[tuple[int, int, int]]:
     return runs
 
 
-def _debug_sft_samples(train_dl: DataLoader, cfg: SFTDataConfig,
-                       tokenizer: BaseTokenizer = None):
+def _debug_sft_samples(
+    train_dl:  DataLoader,
+    cfg:       SFTDataConfig,
+    tokenizer: BaseTokenizer = None,
+):
     """
     Rich SFT debug output. For each sample shows:
-
-    1. Token counts  — total / prompt / response / padding
-    2. Mask bar      — compact visual of where loss is computed
-    3. Turn breakdown — each contiguous prompt/response run with token count
-    4. Formatted template view — full decoded text with color coding
-       cyan  = prompt tokens  (no loss)
-       green = response tokens (loss computed here)
-    5. Raw token ID preview (matches base Trainer style)
-    6. Sanity checks — mask integrity, x/y alignment, all-identical token warning
+      1. Token counts  — total / prompt / response / padding
+      2. Mask bar      — compact visual of where loss is computed
+      3. Turn breakdown
+      4. Formatted template view (cyan=prompt, green=response+closer+EOS)
+      5. Prompt / response decoded blobs
+      6. Sanity checks
     """
     w = 62
     print(f"\n{C.BOLD}{C.MAGENTA}{'─' * w}{C.RESET}")
-    print(f"{C.BOLD}{C.MAGENTA}  🔍 SFT Debug samples (train){C.RESET}")
-    print(f"{C.DIM}  seq_len={cfg.seq_len}  batch_size={cfg.batch_size}  "
-          f"schema={cfg.schema}  template={type(cfg.template).__name__}{C.RESET}")
+    print(f"{C.BOLD}{C.MAGENTA}  SFT Debug samples (train){C.RESET}")
+    print(f"{C.DIM}  seq_len={cfg.seq_len}  batch={cfg.batch_size}  "
+          f"schema={cfg.schema}  template={cfg.template.preset}  "
+          f"trunc={cfg.truncation_strategy}{C.RESET}")
     print(f"{C.DIM}  legend:  "
-          f"{C.CYAN}cyan = prompt (no loss){C.RESET}  "
-          f"{C.GREEN}{C.BOLD}green = response (loss){C.RESET}")
+          f"{C.CYAN}cyan = prompt/header (loss=0){C.RESET}  "
+          f"{C.GREEN}{C.BOLD}green = response+closer+EOS (loss=1){C.RESET}")
     print(f"{C.BOLD}{C.MAGENTA}{'─' * w}{C.RESET}\n")
 
     batch = next(iter(train_dl))
     x_batch, y_batch, mask_batch = batch
-
     n = min(cfg.debug_n, x_batch.shape[0])
 
     for i in range(n):
-        x_ids = x_batch[i].tolist()    # input tokens  (len = seq_len)
-        y_ids = y_batch[i].tolist()    # target tokens (len = seq_len, = x shifted by 1)
-        mask  = mask_batch[i].tolist() # loss mask aligned with y
+        x_ids = x_batch[i].tolist()
+        y_ids = y_batch[i].tolist()
+        mask  = mask_batch[i].tolist()
 
-        # ── token counts ──────────────────────────────────
         n_total    = len(x_ids)
         n_response = int(sum(mask))
-        n_prompt   = sum(1 for m in mask if m == 0.0 and m == m)  # exclude NaN guard
-        n_pad      = sum(1 for tok, m in zip(y_ids, mask) if tok == 0 and m == 0.0)
+        n_pad      = sum(1 for tok, m in zip(y_ids, mask)
+                         if tok == cfg.pad_id and m == 0.0)
         resp_pct   = 100.0 * n_response / max(n_total, 1)
 
         print(f"  {C.BOLD}{C.WHITE}── sample {i+1} ──────────────────────────────────{C.RESET}")
         print(f"  {C.DIM}tokens   {C.RESET}  total={C.WHITE}{n_total}{C.RESET}"
-              f"  prompt={C.CYAN}{n_prompt}{C.RESET}"
               f"  response={C.GREEN}{C.BOLD}{n_response}{C.RESET}"
               f"  pad≈{C.DIM}{n_pad}{C.RESET}"
               f"  resp%={C.MAGENTA}{resp_pct:.1f}%{C.RESET}")
 
-        # ── mask bar ──────────────────────────────────────
         print(f"  {C.DIM}mask bar {C.RESET}  {_mask_bar(mask)}")
 
-        # ── turn breakdown ────────────────────────────────
         runs = _find_turn_boundaries(mask)
         turn_parts = []
         for start, end, mv in runs:
@@ -666,99 +822,106 @@ def _debug_sft_samples(train_dl: DataLoader, cfg: SFTDataConfig,
             turn_parts.append(f"{label}[{start}:{end}]({length}tok)")
         print(f"  {C.DIM}turns    {C.RESET}  " + "  →  ".join(turn_parts))
 
-        # ── formatted template view ───────────────────────
         if tokenizer is not None:
+            # ── formatted view — use stored full_text and response_spans ──────
             try:
-                print(f"\n  {C.DIM}── formatted view (cyan=prompt / green=response) ──{C.RESET}")
-                rendered = _render_masked_text(x_ids, mask, tokenizer, max_chars=480)
-                # indent every line of the rendered text
-                for line in rendered.split("\n"):
-                    print(f"  {line}")
-                print()
+                print(f"\n  {C.DIM}── formatted view ──{C.RESET}")
+                # access dataset directly — no decode needed
+                if hasattr(train_dl.dataset, 'items') and i < len(train_dl.dataset.items):
+                    _, _, full_text, response_spans = train_dl.dataset.items[i]
+
+                    # build char_mask from response_spans
+                    char_mask = [0] * len(full_text)
+                    for start, end in response_spans:
+                        for ci in range(start, min(end, len(full_text))):
+                            char_mask[ci] = 1
+
+                    # colorise
+                    result    = ""
+                    cur_mask  = None
+                    cur_start = 0
+                    for ci, cm in enumerate(char_mask):
+                        if cm != cur_mask:
+                            if cur_mask is not None:
+                                seg     = full_text[cur_start:ci]
+                                result += f"{C.GREEN}{C.BOLD}{seg}{C.RESET}" \
+                                          if cur_mask == 1 else f"{C.CYAN}{seg}{C.RESET}"
+                            cur_mask  = cm
+                            cur_start = ci
+                    if cur_mask is not None:
+                        seg     = full_text[cur_start:]
+                        result += f"{C.GREEN}{C.BOLD}{seg}{C.RESET}" \
+                                  if cur_mask == 1 else f"{C.CYAN}{seg}{C.RESET}"
+
+                    for line in result[:480].split("\n"):
+                        if line:
+                            print(f"  {line}")
+                    print()
+
+                    # ── prompt / response blobs — slice full_text directly ────
+                    def _clip(s, n=120):
+                        return s[:n] + f"{C.DIM}…{C.RESET}" if len(s) > n else s
+
+                    all_resp = set()
+                    for start, end in response_spans:
+                        for ci in range(start, min(end, len(full_text))):
+                            all_resp.add(ci)
+
+                    prompt_text   = "".join(c for ci, c in enumerate(full_text)
+                                            if ci not in all_resp)
+                    response_text = "".join(c for ci, c in enumerate(full_text)
+                                            if ci in all_resp)
+
+                    print(f"  {C.DIM}prompt  :{C.RESET} {C.CYAN}{_clip(repr(prompt_text))}{C.RESET}")
+                    print(f"  {C.DIM}response:{C.RESET} {C.GREEN}{C.BOLD}{_clip(repr(response_text))}{C.RESET}")
+                else:
+                    # streaming dataset — fall back to decode
+                    rendered = _render_masked_text(x_ids, mask, tokenizer, max_chars=480)
+                    for line in rendered.split("\n"):
+                        print(f"  {line}")
+                    print()
             except Exception as e:
                 print(f"  {C.YELLOW}⚠  render failed: {e}{C.RESET}\n")
-
-            # ── separate prompt / response decoded blobs ──
-            try:
-                # decode contiguous runs rather than scattered token IDs
-                # so BPE merges are preserved within each segment
-                runs    = _find_turn_boundaries(mask)
-                p_parts = []
-                r_parts = []
-                for start, end, mv in runs:
-                    seg_ids = x_ids[start: end + 1] if mv == 0 else y_ids[start: end + 1]
-                    try:
-                        decoded = tokenizer.decode(seg_ids)
-                    except Exception:
-                        decoded = " ".join(str(t) for t in seg_ids)
-                    if mv == 0:
-                        p_parts.append(decoded)
-                    else:
-                        r_parts.append(decoded)
-
-                p_text = "".join(p_parts)
-                r_text = "".join(r_parts)
-
-                def _clip(s, n=120):
-                    return s[:n] + f"{C.DIM}…{C.RESET}" if len(s) > n else s
-
-                print(f"  {C.DIM}prompt  :{C.RESET} {C.CYAN}{_clip(repr(p_text))}{C.RESET}")
-                print(f"  {C.DIM}response:{C.RESET} {C.GREEN}{C.BOLD}{_clip(repr(r_text))}{C.RESET}")
-            except Exception as e:
-                print(f"  {C.YELLOW}⚠  decode failed: {e}{C.RESET}")
         else:
-            # no tokenizer — show raw IDs like base _debug_samples
             x_preview = x_ids[:16]
             tail      = f" … +{len(x_ids)-16}" if len(x_ids) > 16 else ""
             print(f"  {C.DIM}x ids    {C.RESET}  {C.CYAN}{x_preview}{tail}{C.RESET}")
-            m_preview = [int(m) for m in mask[:16]]
-            print(f"  {C.DIM}mask     {C.RESET}  {C.GREEN}{m_preview}{tail}{C.RESET}")
+            print(f"  {C.DIM}mask     {C.RESET}  {C.GREEN}{[int(m) for m in mask[:16]]}{tail}{C.RESET}")
 
-        # ── sanity checks ─────────────────────────────────
         print()
         checks_ok = True
 
-        # 1. mask integrity
         if n_response == 0:
             print(f"  {C.RED}✗  MASK: zero response tokens — check schema / template{C.RESET}")
             checks_ok = False
         else:
-            print(f"  {C.GREEN}✓  mask: {n_response} response tokens ({resp_pct:.1f}% of seq){C.RESET}")
+            print(f"  {C.GREEN}✓  mask: {n_response} response tokens ({resp_pct:.1f}%){C.RESET}")
 
-        # 2. x/y alignment (y should be x shifted by 1)
         if x_ids[1:] != y_ids[:-1]:
-            print(f"  {C.RED}✗  ALIGNMENT: y is not x shifted by 1 — check dataset{C.RESET}")
+            print(f"  {C.RED}✗  ALIGNMENT: y is not x shifted by 1{C.RESET}")
             checks_ok = False
         else:
             print(f"  {C.GREEN}✓  alignment: y = x shifted by 1{C.RESET}")
 
-        # 3. all-identical token warning (tokenizer bug detector)
         if len(set(x_ids)) == 1:
-            print(f"  {C.RED}✗  TOKENS: all input tokens identical — possible tokenizer bug{C.RESET}")
+            print(f"  {C.RED}✗  TOKENS: all identical — possible tokenizer bug{C.RESET}")
             checks_ok = False
 
-        # 4. mask/y length match
         if len(mask) != len(y_ids):
-            print(f"  {C.RED}✗  LENGTH: mask length {len(mask)} ≠ y length {len(y_ids)}{C.RESET}")
+            print(f"  {C.RED}✗  LENGTH: mask {len(mask)} ≠ y {len(y_ids)}{C.RESET}")
             checks_ok = False
 
-        # 5. padding warning — warn only when padding dominates actual content
-        n_content    = n_total - n_pad           # real tokens (prompt + response)
-        pad_of_content = n_pad / max(n_content, 1)
-        if pad_of_content > 3.0:                 # padding is >3x the real content
-            suggested = max(16, int(n_content * 1.25 // 16) * 16)  # round up to nearest 16
-            print(f"  {C.YELLOW}⚠  PADDING: {n_pad} pad tokens vs {n_content} content tokens "
-                  f"— seq_len={cfg.seq_len} may be too large; "
-                  f"try seq_len={suggested}{C.RESET}")
+        n_content = n_total - n_pad
+        if n_pad / max(n_content, 1) > 3.0:
+            suggested = max(16, int(n_content * 1.25 // 16) * 16)
+            print(f"  {C.YELLOW}⚠  PADDING: {n_pad} pad vs {n_content} content tokens "
+                  f"— try seq_len={suggested}{C.RESET}")
 
-        # 6. response fraction sanity
         if n_response > 0 and resp_pct < 5.0:
-            print(f"  {C.YELLOW}⚠  RATIO: only {resp_pct:.1f}% response tokens "
-                  f"— prompt may be very long relative to response{C.RESET}")
+            print(f"  {C.YELLOW}⚠  RATIO: only {resp_pct:.1f}% response tokens{C.RESET}")
 
         if checks_ok:
             print(f"  {C.GREEN}✓  all checks passed{C.RESET}")
-
         print()
 
     print(f"{C.BOLD}{C.MAGENTA}{'─' * w}{C.RESET}\n")
@@ -766,17 +929,47 @@ def _debug_sft_samples(train_dl: DataLoader, cfg: SFTDataConfig,
 
 # ─── shared loader builder ────────────────────────────────────────────────────
 
+def _build_datasets(
+    samples:   list[dict],
+    tokenizer: BaseTokenizer,
+    cfg:       SFTDataConfig,
+) -> tuple["SFTDataset", "SFTDataset"]:
+    """Split samples and build train/val SFTDataset pairs."""
+    split_at      = int(len(samples) * cfg.split)
+    train_samples = samples[:split_at]
+    val_samples   = samples[split_at:]
+
+    print(f"  {C.DIM}tokenizing train...{C.RESET}")
+    train_ds = SFTDataset(
+        train_samples, tokenizer, cfg.template, cfg.seq_len,
+        cfg.schema, cfg.bos_id, cfg.eos_id, cfg.pad_id, cfg.truncation_strategy,
+    )
+    print(f"  {C.DIM}tokenizing val...{C.RESET}")
+    val_ds = SFTDataset(
+        val_samples, tokenizer, cfg.template, cfg.seq_len,
+        cfg.schema, cfg.bos_id, cfg.eos_id, cfg.pad_id, cfg.truncation_strategy,
+    )
+    return train_ds, val_ds
+
+
 def _sft_loaders(
-    train_ds, val_ds, cfg: SFTDataConfig,
-    shuffle=None, tokenizer: BaseTokenizer = None,
+    train_ds,
+    val_ds,
+    cfg:       SFTDataConfig,
+    shuffle:   bool            = None,
+    tokenizer: BaseTokenizer   = None,
 ) -> tuple[DataLoader, DataLoader]:
     s        = cfg.shuffle if shuffle is None else shuffle
-    train_dl = DataLoader(train_ds, batch_size=cfg.batch_size, shuffle=s,
-                          num_workers=cfg.num_workers, pin_memory=cfg.pin_memory)
-    val_dl   = DataLoader(val_ds,   batch_size=cfg.batch_size, shuffle=False,
-                          num_workers=cfg.num_workers, pin_memory=cfg.pin_memory)
+    train_dl = DataLoader(
+        train_ds, batch_size=cfg.batch_size, shuffle=s,
+        num_workers=cfg.num_workers, pin_memory=cfg.pin_memory,
+    )
+    val_dl = DataLoader(
+        val_ds, batch_size=cfg.batch_size, shuffle=False,
+        num_workers=cfg.num_workers, pin_memory=cfg.pin_memory,
+    )
 
-    if isinstance(train_ds, Dataset):   # not streaming
+    if isinstance(train_ds, Dataset):
         print(f"  {C.DIM}train{C.RESET}  {C.WHITE}{len(train_ds):>10,}{C.RESET} samples  "
               f"{C.DIM}│{C.RESET}  {C.YELLOW}{len(train_dl):,}{C.RESET} batches")
         print(f"  {C.DIM}val  {C.RESET}  {C.WHITE}{len(val_ds):>10,}{C.RESET} samples  "
@@ -786,11 +979,6 @@ def _sft_loaders(
         _debug_sft_samples(train_dl, cfg, tokenizer)
 
     return train_dl, val_dl
-
-
-def _split_samples(samples: list[dict], cfg: SFTDataConfig):
-    split_at = int(len(samples) * cfg.split)
-    return samples[:split_at], samples[split_at:]
 
 
 # ─── public API ───────────────────────────────────────────────────────────────
@@ -808,35 +996,32 @@ def from_sft_json(
     Example JSON:
         [{"prompt": "hi", "response": "hello"}, ...]
 
-    Example JSONL:
-        {"messages": [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "hello"}]}
-        ...
+    Example JSONL (multi-turn):
+        {"messages": [{"role": "user", "content": "hi"},
+                      {"role": "assistant", "content": "hello"}]}
     """
-    _section("📄 SFT JSON dataset")
-    _info("path",   path)
-    _info("schema", cfg.schema)
+    _section("SFT JSON dataset")
+    _info("path",                 path)
+    _info("schema",               cfg.schema)
+    _info("template",             cfg.template.preset)
+    _info("truncation_strategy",  cfg.truncation_strategy)
 
     p = Path(path)
     if p.suffix == ".jsonl":
-        samples = [json.loads(line) for line in p.read_text(encoding="utf-8").splitlines() if line.strip()]
+        samples = [
+            json.loads(line)
+            for line in p.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
     else:
         samples = json.loads(p.read_text(encoding="utf-8"))
 
     _info("records", f"{len(samples):,}")
 
     if cfg.schema == "auto" and samples:
-        detected = _detect_schema(samples[0])
-        _info("detected schema", detected)
+        _info("detected schema", _detect_schema(samples[0]))
 
-    train_samples, val_samples = _split_samples(samples, cfg)
-
-    print(f"  {C.DIM}tokenizing train...{C.RESET}")
-    train_ds = SFTDataset(train_samples, tokenizer, cfg.template,
-                          cfg.seq_len, cfg.schema, cfg.bos_id, cfg.eos_id)
-    print(f"  {C.DIM}tokenizing val...{C.RESET}")
-    val_ds   = SFTDataset(val_samples,   tokenizer, cfg.template,
-                          cfg.seq_len, cfg.schema, cfg.bos_id, cfg.eos_id)
-
+    train_ds, val_ds = _build_datasets(samples, tokenizer, cfg)
     return _sft_loaders(train_ds, val_ds, cfg, tokenizer=tokenizer)
 
 
@@ -847,27 +1032,18 @@ def from_sft_strings(
 ) -> tuple[DataLoader, DataLoader]:
     """
     Load from a list of dicts already in memory.
-
     Useful for quick experiments or programmatic dataset construction.
-    Schema auto-detected unless cfg.schema is set.
     """
-    _section("📝 SFT String dataset")
-    _info("records", str(len(samples)))
-    _info("schema",  cfg.schema)
+    _section("SFT String dataset")
+    _info("records",              str(len(samples)))
+    _info("schema",               cfg.schema)
+    _info("template",             cfg.template.preset)
+    _info("truncation_strategy",  cfg.truncation_strategy)
 
     if cfg.schema == "auto" and samples:
-        detected = _detect_schema(samples[0])
-        _info("detected schema", detected)
+        _info("detected schema", _detect_schema(samples[0]))
 
-    train_samples, val_samples = _split_samples(samples, cfg)
-
-    print(f"  {C.DIM}tokenizing train...{C.RESET}")
-    train_ds = SFTDataset(train_samples, tokenizer, cfg.template,
-                          cfg.seq_len, cfg.schema, cfg.bos_id, cfg.eos_id)
-    print(f"  {C.DIM}tokenizing val...{C.RESET}")
-    val_ds   = SFTDataset(val_samples,   tokenizer, cfg.template,
-                          cfg.seq_len, cfg.schema, cfg.bos_id, cfg.eos_id)
-
+    train_ds, val_ds = _build_datasets(samples, tokenizer, cfg)
     return _sft_loaders(train_ds, val_ds, cfg, tokenizer=tokenizer)
 
 
@@ -878,13 +1054,15 @@ def from_sft_files(
 ) -> tuple[DataLoader, DataLoader]:
     """
     Load and concatenate multiple .json / .jsonl files.
-
     If cfg.streaming=True, splits files into train/val groups and streams
     them without loading everything into RAM.
     """
-    _section("📂 SFT File dataset")
-    for p in paths: _info("file", p)
-    _info("schema", cfg.schema)
+    _section("SFT File dataset")
+    for p in paths:
+        _info("file", p)
+    _info("schema",               cfg.schema)
+    _info("template",             cfg.template.preset)
+    _info("truncation_strategy",  cfg.truncation_strategy)
 
     if cfg.streaming:
         split_at    = max(1, int(len(paths) * cfg.split))
@@ -902,12 +1080,14 @@ def from_sft_files(
                     for item in json.loads(p.read_text(encoding="utf-8")):
                         yield item
 
-        train_ds = StreamingSFTDataset(_file_iter(train_paths), tokenizer,
-                                       cfg.template, cfg.seq_len, cfg.schema,
-                                       cfg.bos_id, cfg.eos_id)
-        val_ds   = StreamingSFTDataset(_file_iter(val_paths),   tokenizer,
-                                       cfg.template, cfg.seq_len, cfg.schema,
-                                       cfg.bos_id, cfg.eos_id)
+        train_ds = StreamingSFTDataset(
+            _file_iter(train_paths), tokenizer, cfg.template, cfg.seq_len,
+            cfg.schema, cfg.bos_id, cfg.eos_id, cfg.pad_id, cfg.truncation_strategy,
+        )
+        val_ds = StreamingSFTDataset(
+            _file_iter(val_paths), tokenizer, cfg.template, cfg.seq_len,
+            cfg.schema, cfg.bos_id, cfg.eos_id, cfg.pad_id, cfg.truncation_strategy,
+        )
         return _sft_loaders(train_ds, val_ds, cfg, shuffle=False, tokenizer=tokenizer)
 
     # in-memory: load all files and concatenate
@@ -926,18 +1106,9 @@ def from_sft_files(
     _info("total records", f"{len(all_samples):,}")
 
     if cfg.schema == "auto" and all_samples:
-        detected = _detect_schema(all_samples[0])
-        _info("detected schema", detected)
+        _info("detected schema", _detect_schema(all_samples[0]))
 
-    train_samples, val_samples = _split_samples(all_samples, cfg)
-
-    print(f"  {C.DIM}tokenizing train...{C.RESET}")
-    train_ds = SFTDataset(train_samples, tokenizer, cfg.template,
-                          cfg.seq_len, cfg.schema, cfg.bos_id, cfg.eos_id)
-    print(f"  {C.DIM}tokenizing val...{C.RESET}")
-    val_ds   = SFTDataset(val_samples,   tokenizer, cfg.template,
-                          cfg.seq_len, cfg.schema, cfg.bos_id, cfg.eos_id)
-
+    train_ds, val_ds = _build_datasets(all_samples, tokenizer, cfg)
     return _sft_loaders(train_ds, val_ds, cfg, tokenizer=tokenizer)
 
 
@@ -946,11 +1117,9 @@ def from_sft_hf(
     tokenizer:    BaseTokenizer,
     cfg:          SFTDataConfig,
     split:        str = "train",
-    text_col:     str = None,       # None = auto-detect from schema
 ) -> tuple[DataLoader, DataLoader]:
     """
     Load from a HuggingFace dataset.
-
     Schema is auto-detected from the first row, or override with cfg.schema.
     Supports streaming (cfg.streaming=True) for large datasets.
 
@@ -959,33 +1128,38 @@ def from_sft_hf(
         "tatsu-lab/alpaca"       → instruction schema
         "stanfordnlp/SHP"        → prompt_response schema
     """
-    _section("🤗 SFT HuggingFace dataset")
-    _info("dataset",   dataset_name)
-    _info("split",     split)
-    _info("schema",    cfg.schema)
-    _info("streaming", str(cfg.streaming))
+    _section("SFT HuggingFace dataset")
+    _info("dataset",              dataset_name)
+    _info("split",                split)
+    _info("schema",               cfg.schema)
+    _info("template",             cfg.template.preset)
+    _info("truncation_strategy",  cfg.truncation_strategy)
+    _info("streaming",            str(cfg.streaming))
 
     from datasets import load_dataset
 
     if cfg.streaming:
-        val_n   = max(1, cfg.batch_size * 20)
+        val_n    = max(1, cfg.batch_size * 20)
         ds_train = load_dataset(dataset_name, split=split, streaming=True)
         ds_val   = load_dataset(dataset_name, split=split, streaming=True)
-
         print(f"  {C.YELLOW}⚠  streaming: val = first {val_n} rows{C.RESET}")
 
         train_ds = StreamingSFTDataset(
-            ds_train.skip(val_n), tokenizer, cfg.template,
-            cfg.seq_len, cfg.schema, cfg.bos_id, cfg.eos_id
+            ds_train.skip(val_n), tokenizer, cfg.template, cfg.seq_len,
+            cfg.schema, cfg.bos_id, cfg.eos_id, cfg.pad_id, cfg.truncation_strategy,
         )
         val_ds = StreamingSFTDataset(
-            ds_val.take(val_n), tokenizer, cfg.template,
-            cfg.seq_len, cfg.schema, cfg.bos_id, cfg.eos_id
+            ds_val.take(val_n), tokenizer, cfg.template, cfg.seq_len,
+            cfg.schema, cfg.bos_id, cfg.eos_id, cfg.pad_id, cfg.truncation_strategy,
         )
-        train_dl = DataLoader(train_ds, batch_size=cfg.batch_size,
-                              num_workers=cfg.num_workers, pin_memory=cfg.pin_memory)
-        val_dl   = DataLoader(val_ds,   batch_size=cfg.batch_size,
-                              num_workers=cfg.num_workers, pin_memory=cfg.pin_memory)
+        train_dl = DataLoader(
+            train_ds, batch_size=cfg.batch_size,
+            num_workers=cfg.num_workers, pin_memory=cfg.pin_memory,
+        )
+        val_dl = DataLoader(
+            val_ds, batch_size=cfg.batch_size,
+            num_workers=cfg.num_workers, pin_memory=cfg.pin_memory,
+        )
         _ok("streaming SFT dataloaders ready")
         return train_dl, val_dl
 
@@ -996,16 +1170,7 @@ def from_sft_hf(
     _ok(f"downloaded {len(samples):,} samples")
 
     if cfg.schema == "auto" and samples:
-        detected = _detect_schema(samples[0])
-        _info("detected schema", detected)
+        _info("detected schema", _detect_schema(samples[0]))
 
-    train_samples, val_samples = _split_samples(samples, cfg)
-
-    print(f"  {C.DIM}tokenizing train...{C.RESET}")
-    train_ds = SFTDataset(train_samples, tokenizer, cfg.template,
-                          cfg.seq_len, cfg.schema, cfg.bos_id, cfg.eos_id)
-    print(f"  {C.DIM}tokenizing val...{C.RESET}")
-    val_ds   = SFTDataset(val_samples,   tokenizer, cfg.template,
-                          cfg.seq_len, cfg.schema, cfg.bos_id, cfg.eos_id)
-
+    train_ds, val_ds = _build_datasets(samples, tokenizer, cfg)
     return _sft_loaders(train_ds, val_ds, cfg, tokenizer=tokenizer)
