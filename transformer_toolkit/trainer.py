@@ -84,32 +84,32 @@ class TrainConfig(BaseModel):
 
     # ── optimiser ─────────────────────────────────────────────────────────────
     lr:               float = Field(3e-4,  description="Peak learning rate after warmup")
-    weight_decay:     float = Field(0.1,   description="L2 penalty applied to 2D weights only, not biases or norms")
-    beta1:            float = Field(0.9,   description="AdamW beta1 — running mean of gradients")
-    beta2:            float = Field(0.95,  description="AdamW beta2 — running mean of squared gradients")
-    grad_clip:        float = Field(1.0,   description="Max gradient norm — prevents exploding gradients")
+    weight_decay:     float = Field(0.1,   description="L2 penalty applied to 2D weights only")
+    beta1:            float = Field(0.9,   description="AdamW beta1")
+    beta2:            float = Field(0.95,  description="AdamW beta2")
+    grad_clip:        float = Field(1.0,   description="Max gradient norm")
 
     # ── lr schedule ───────────────────────────────────────────────────────────
-    warmup_steps:     int   = Field(200,   description="Linearly ramp lr from 0 to peak over this many steps")
-    min_lr:           float = Field(3e-5,  description="Floor lr after cosine decay, typically lr / 10")
+    warmup_steps:     int   = Field(200,   description="Linear warmup steps")
+    min_lr:           float = Field(3e-5,  description="Floor lr after cosine decay")
 
     # ── efficiency ────────────────────────────────────────────────────────────
-    grad_accum_steps: int   = Field(1,     description="Accumulate gradients over N batches — effective batch = batch_size × grad_accum_steps")
-    mixed_precision:  bool  = Field(True,  description="Use bf16 or fp16 for faster training, falls back to fp32 on CPU")
-    grad_checkpoint:  bool  = Field(False, description="Recompute activations during backward to save memory at ~20% speed cost")
+    grad_accum_steps: int   = Field(1,     description="Gradient accumulation steps")
+    mixed_precision:  bool  = Field(True,  description="Use bf16/fp16")
+    grad_checkpoint:  bool  = Field(False, description="Activation checkpointing")
 
     # ── checkpoints ───────────────────────────────────────────────────────────
-    ckpt_dir:         str   = Field("checkpoints", description="Directory to save all checkpoint files")
-    save_best:        bool  = Field(True,           description="Save best.pt whenever val loss improves")
+    ckpt_dir:         str   = Field("checkpoints", description="Checkpoint directory")
+    save_best:        bool  = Field(True,           description="Save best.pt on val improvement")
     save_step_ckpts:  bool  = Field(True,           description="Save step_N.pt every save_every steps")
 
     # ── huggingface hub ───────────────────────────────────────────────────────
-    hf_repo:          Optional[str] = Field(None,  description="HuggingFace repo id e.g. 'username/my-model'. None = disabled")
+    hf_repo:          Optional[str] = Field(None,  description="HuggingFace repo id")
     hf_private:       bool          = Field(True,  description="Make HF repo private")
-    hf_push_best:     bool          = Field(True,  description="Push to HF whenever best val loss improves")
-    hf_push_every_n:  bool          = Field(False, description="Push to HF every save_every steps")
-    hf_push_end:      bool          = Field(True,  description="Push to HF at end of training")
-    hf_push_on_pause: bool          = Field(True,  description="Push to HF when training is paused with Ctrl+C")
+    hf_push_best:     bool          = Field(True,  description="Push on best val loss")
+    hf_push_every_n:  bool          = Field(False, description="Push every save_every steps")
+    hf_push_end:      bool          = Field(True,  description="Push at end of training")
+    hf_push_on_pause: bool          = Field(True,  description="Push on Ctrl+C pause")
 
     class Config:
         validate_assignment = True
@@ -118,8 +118,6 @@ class TrainConfig(BaseModel):
 # ─── lr schedule ──────────────────────────────────────────────────────────────
 
 def get_lr(step: int, cfg: TrainConfig) -> float:
-    # start from a small non-zero lr at step 0 (1/warmup_steps of peak)
-    # so the very first update is not a zero-gradient no-op
     if step < cfg.warmup_steps:
         return cfg.lr * max(step, 1) / cfg.warmup_steps
     progress = (step - cfg.warmup_steps) / max(1, cfg.max_steps - cfg.warmup_steps)
@@ -129,34 +127,54 @@ def get_lr(step: int, cfg: TrainConfig) -> float:
 
 # ─── checkpoint ───────────────────────────────────────────────────────────────
 
-def save_ckpt(path: str, model, optimizer, scaler, step: int, val_loss: float):
+def save_ckpt(path: str, model, optimizer, scaler, step: int, val_loss: float,
+              stream_state: dict = None):
+    """
+    Save a training checkpoint.
+    stream_state: dict from HFStreamDataset.state_dict() — None for non-streaming runs.
+    """
     from pathlib import Path
-    # FIX: use Path.parent.mkdir so an empty dirname (path with no directory)
-    # doesn't cause os.makedirs("") to raise FileNotFoundError
     Path(path).parent.mkdir(parents=True, exist_ok=True)
-    # Use state_dict_for_save if available to avoid broken weight tying on resume
     model_sd = model.state_dict_for_save() if hasattr(model, "state_dict_for_save") else model.state_dict()
     torch.save({
-        "step":      step,
-        "val_loss":  val_loss,
-        "model":     model_sd,
-        "optimizer": optimizer.state_dict(),
-        "scaler":    scaler.state_dict(),
+        "step":         step,
+        "val_loss":     val_loss,
+        "model":        model_sd,
+        "optimizer":    optimizer.state_dict(),
+        "scaler":       scaler.state_dict(),
+        "stream_state": stream_state,   # None if not streaming — safe to ignore on load
     }, path)
     _ckpt_line(path)
 
+    # print stream position if available
+    if stream_state is not None:
+        rows   = stream_state.get("rows_seen", 0)
+        chunks = stream_state.get("chunks_seen", 0)
+        tokens = stream_state.get("tokens_seen", 0)
+        print(f"  {C.DIM}stream  rows={rows:,}  chunks={chunks:,}  tokens={tokens:,}{C.RESET}")
+
 
 def load_ckpt(path: str, model, optimizer=None, scaler=None):
+    """
+    Load a checkpoint. Returns (step, val_loss, stream_state).
+    stream_state is None for checkpoints saved without streaming.
+    """
     ckpt = torch.load(path, map_location="cpu", weights_only=False)
-    # Use load_state_dict_with_tie if available to re-apply weight tying
     if hasattr(model, "load_state_dict_with_tie"):
         model.load_state_dict_with_tie(ckpt["model"])
     else:
         model.load_state_dict(ckpt["model"])
     if optimizer: optimizer.load_state_dict(ckpt["optimizer"])
     if scaler:    scaler.load_state_dict(ckpt["scaler"])
-    print(f"  {C.GREEN}▶  resumed from step {ckpt['step']}{C.RESET}  best_loss={ckpt['val_loss']:.4f}\n")
-    return ckpt["step"], ckpt["val_loss"]
+
+    stream_state = ckpt.get("stream_state")   # None for old checkpoints
+    print(f"  {C.GREEN}▶  resumed from step {ckpt['step']}{C.RESET}  "
+          f"best_loss={ckpt['val_loss']:.4f}")
+    if stream_state is not None:
+        rows = stream_state.get("rows_seen", 0)
+        print(f"  {C.DIM}stream position: row {rows:,}{C.RESET}")
+    print()
+    return ckpt["step"], ckpt["val_loss"], stream_state
 
 
 # ─── eval ─────────────────────────────────────────────────────────────────────
@@ -174,33 +192,29 @@ def evaluate(model, val_dl, vocab_size: int, device, cfg: TrainConfig) -> float:
         losses.append(loss.item())
         if len(losses) >= 20: break
     model.train()
-    # FIX: guard against empty val_dl instead of dividing by zero
     return sum(losses) / len(losses) if losses else float("inf")
 
 
 # ─── trainer ──────────────────────────────────────────────────────────────────
 
 class Trainer:
-    def __init__(self, model, train_dl, val_dl, vocab_size: int, cfg: TrainConfig, tokenizer=None):
+    def __init__(self, model, train_dl, val_dl, vocab_size: int, cfg: TrainConfig,
+                 tokenizer=None, hf_kwargs: dict = None):
         self.model      = model
         self.train_dl   = train_dl
         self.val_dl     = val_dl
         self.vocab_size = vocab_size
         self.cfg        = cfg
         self.tokenizer  = tokenizer
+        self._hf_kwargs = hf_kwargs   # stored for dataloader rebuild on streaming resume
         self.device     = next(model.parameters()).device
-        # FIX: pass device so _dtype() can return float32 on CPU
         self.dtype      = _dtype(cfg, self.device)
         self.best_loss  = float("inf")
 
-        # gradient checkpointing — PyTorch native via block-level checkpoint.
-        # gradient_checkpointing_enable() is a HuggingFace method and does not
-        # exist on plain nn.Module. We set use_checkpoint on each block instead.
         if cfg.grad_checkpoint:
             for block in model.blocks:
                 block.use_checkpoint = True
 
-        # optimiser — no weight decay on biases/norms
         decay    = [p for p in model.parameters() if p.dim() >= 2]
         no_decay = [p for p in model.parameters() if p.dim() <  2]
         self.optimizer = torch.optim.AdamW([
@@ -210,11 +224,8 @@ class Trainer:
 
         self.scaler     = GradScaler(enabled=cfg.mixed_precision and self.device.type != "cpu")
         self._pause_req = False
+        self._hf        = HFSyncWorker() if cfg.hf_repo else None
 
-        # background HF upload worker — only created if hf_repo is set
-        self._hf = HFSyncWorker() if cfg.hf_repo else None
-
-        # pause handler
         if cfg.interruptible:
             signal.signal(signal.SIGINT,  self._handle_pause)
             signal.signal(signal.SIGTERM, self._handle_pause)
@@ -223,14 +234,27 @@ class Trainer:
         print(f"\n{C.YELLOW}  ⏸  pause requested — finishing step...{C.RESET}")
         self._pause_req = True
 
+    def _stream_state(self) -> dict | None:
+        """Return state_dict from train dataset if it is an HFStreamDataset."""
+        ds = self.train_dl.dataset
+        if hasattr(ds, "state_dict"):
+            return ds.state_dict()
+        return None
+
     def train(self, resume_from: str = None):
         step     = 0
-        # initialise val_loss so it is always defined even if save_every
-        # fires before the first eval (i.e. save_every < eval_every)
         val_loss = float("inf")
 
         if resume_from:
-            step, self.best_loss = load_ckpt(resume_from, self.model, self.optimizer, self.scaler)
+            step, self.best_loss, stream_state = load_ckpt(
+                resume_from, self.model, self.optimizer, self.scaler
+            )
+            # rebuild dataloader from scratch at the resumed stream position
+            if stream_state is not None and self._hf_kwargs is not None:
+                from .dataloader import from_hf
+                self.train_dl, self.val_dl = from_hf(
+                    **self._hf_kwargs, _stream_state=stream_state
+                )
 
         cfg       = self.cfg
         model     = self.model
@@ -251,7 +275,8 @@ class Trainer:
             # ── pause check ───────────────────────────────────
             if self._pause_req:
                 path = f"{cfg.ckpt_dir}/pause_step_{step}.pt"
-                save_ckpt(path, model, optimizer, self.scaler, step, val_loss)
+                save_ckpt(path, model, optimizer, self.scaler, step, val_loss,
+                          stream_state=self._stream_state())
                 _pause_line(step, path)
 
                 if self._hf and cfg.hf_repo and cfg.hf_push_on_pause:
@@ -268,7 +293,6 @@ class Trainer:
                         step      = step,
                         private   = cfg.hf_private,
                     )
-                    # hf_hub.HFSyncWorker.wait() takes no arguments
                     self._hf.wait()
                     self._hf.shutdown()
 
@@ -281,7 +305,6 @@ class Trainer:
 
             # ── forward + backward ────────────────────────────
             optimizer.zero_grad()
-            # FIX: accumulate loss over all micro-batches for correct logging
             accum_loss = 0.0
             for _ in range(cfg.grad_accum_steps):
                 x, y = next(loader)
@@ -303,14 +326,18 @@ class Trainer:
 
             step += 1
 
-            # ── live progress bar (every step) ────────────────
-            # FIX: accum_loss already equals mean loss (each micro loss was /grad_accum)
+            # ── live progress bar ──────────────────────────────
             current_loss = accum_loss
             dt           = time.time() - t0
             tps          = tokens / max(dt, 1e-6)
             eta          = (cfg.max_steps - step) * (time.time() - t_start) / max(step, 1)
             eta_str      = f"{eta/60:.1f}m" if eta > 60 else f"{eta:.0f}s"
             lc           = _loss_color(current_loss)
+
+            # tokens consumed so far (absolute, across all steps)
+            total_tokens = step * cfg.grad_accum_steps * self.train_dl.batch_size
+            if hasattr(self.train_dl.dataset, "seq_len"):
+                total_tokens *= self.train_dl.dataset.seq_len
 
             print(
                 f"\r  {C.DIM}step{C.RESET} {C.BOLD}{C.WHITE}{step:>6}{C.RESET}/{cfg.max_steps}"
@@ -322,7 +349,11 @@ class Trainer:
             )
 
             if step % cfg.log_every == 0:
-                print(f"  {C.DIM}tok/s{C.RESET} {C.YELLOW}{tps:,.0f}{C.RESET}")
+                # show tok/s + total tokens consumed
+                print(
+                    f"  {C.DIM}tok/s{C.RESET} {C.YELLOW}{tps:,.0f}{C.RESET}"
+                    f"  {C.DIM}total{C.RESET} {C.CYAN}{total_tokens:,}{C.RESET}"
+                )
                 tokens = 0
                 t0     = time.time()
 
@@ -331,12 +362,13 @@ class Trainer:
                 val_loss  = evaluate(model, self.val_dl, self.vocab_size, self.device, cfg)
                 ppl       = math.exp(min(val_loss, 20))
                 saved     = val_loss < self.best_loss
-                prev_best = self.best_loss  # capture before mutating so delta is non-zero on new best
+                prev_best = self.best_loss
 
                 if saved:
                     self.best_loss = val_loss
                     if cfg.save_best:
-                        save_ckpt(f"{cfg.ckpt_dir}/best.pt", model, optimizer, self.scaler, step, val_loss)
+                        save_ckpt(f"{cfg.ckpt_dir}/best.pt", model, optimizer, self.scaler,
+                                  step, val_loss, stream_state=self._stream_state())
 
                     if self._hf and cfg.hf_push_best:
                         self._hf.push(
@@ -353,26 +385,25 @@ class Trainer:
                         )
 
                 _eval_line(step, val_loss, ppl, prev_best, saved)
-                # reset throughput counters so eval wall time doesn't
-                # pollute the tok/s reading on the next log line
                 tokens = 0
                 t0     = time.time()
 
             # ── step checkpoint ───────────────────────────────
             if cfg.save_step_ckpts and step % cfg.save_every == 0:
-                save_ckpt(f"{cfg.ckpt_dir}/step_{step}.pt", model, optimizer, self.scaler, step, val_loss)
+                save_ckpt(f"{cfg.ckpt_dir}/step_{step}.pt", model, optimizer, self.scaler,
+                          step, val_loss, stream_state=self._stream_state())
 
                 if self._hf and cfg.hf_push_every_n:
                     self._hf.push(
-                        model   = model,
+                        model     = model,
                         optimizer = optimizer,
                         scaler    = self.scaler,
                         val_loss  = val_loss,
-                        repo_id = cfg.hf_repo,
-                        cfg     = model.cfg,
-                        metrics = {"val_loss": val_loss},
-                        step    = step,
-                        private = cfg.hf_private,
+                        repo_id   = cfg.hf_repo,
+                        cfg       = model.cfg,
+                        metrics   = {"val_loss": val_loss},
+                        step      = step,
+                        private   = cfg.hf_private,
                     )
 
         # ── end of training ───────────────────────────────────
@@ -404,7 +435,6 @@ def _infinite(dl):
 
 
 def _dtype(cfg: TrainConfig, device: torch.device) -> torch.dtype:
-    # FIX: CPU does not support float16 autocast — always return float32 on CPU
     if not cfg.mixed_precision or device.type == "cpu":
         return torch.float32
     return torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
