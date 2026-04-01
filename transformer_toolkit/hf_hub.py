@@ -78,12 +78,15 @@ def push_to_hub(
     optimizer_state: dict = None,
     scaler_state:    dict = None,
     val_loss:        float = None,
+    silent: bool = False,
 ):
     try:
         from huggingface_hub import HfApi, create_repo
     except ImportError:
         _err("pip install huggingface_hub")
         return
+    def _print(*a, **kw):
+        if not silent: print(*a, **kw)
 
     state = model_state or (model.state_dict() if model else None)
     if state is None:
@@ -121,6 +124,7 @@ def push_to_hub(
         _upload_files(api, tmp, repo_id, commit_msg)
 
     shutil.rmtree(tmp, ignore_errors=True)
+
 
 
 # ─── pull ─────────────────────────────────────────────────────────────────────

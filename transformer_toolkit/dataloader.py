@@ -102,9 +102,11 @@ class HFStreamDataset(IterableDataset):
         eos_id:       int = None,
         skip_rows:    int = 0,          # rows already consumed (restored on resume)
         take_rows:    int = None,       # None = stream forever; int = take N rows
+        config:       str = None,       # HF dataset config e.g. 'sample-10BT'
     ):
         self.dataset_name = dataset_name
         self.split        = split
+        self.config       = config
         self.tokenizer    = tokenizer
         self.seq_len      = seq_len
         self.text_col     = text_col
@@ -120,7 +122,9 @@ class HFStreamDataset(IterableDataset):
 
     def _build_source(self):
         from datasets import load_dataset
-        ds = load_dataset(self.dataset_name, split=self.split, streaming=True)
+        kwargs = dict(split=self.split, streaming=True)
+        if self.config: kwargs['name'] = self.config
+        ds = load_dataset(self.dataset_name, **kwargs)
         if self.skip_rows:
             ds = ds.skip(self.skip_rows)
         if self.take_rows is not None:
@@ -403,6 +407,7 @@ def from_hf(dataset_name: str, tokenizer: BaseTokenizer, cfg: DataConfig,
             eos_id:     int = None,
             train_path: str = None,
             val_path:   str = None,
+            config:     str = None,       # HF dataset config e.g. 'sample-10BT'
             _stream_state: dict = None,   # internal — passed by trainer on resume
             ) -> tuple[DataLoader, DataLoader]:
     """
@@ -442,8 +447,9 @@ def from_hf(dataset_name: str, tokenizer: BaseTokenizer, cfg: DataConfig,
             text_col     = text_col,
             bos_id       = bos_id,
             eos_id       = eos_id,
-            skip_rows    = val_n + skip_rows,   # skip val window + already-consumed rows
-            take_rows    = None,                # stream forever
+            skip_rows    = val_n + skip_rows,
+            take_rows    = None,
+            config       = config,
         )
         val_ds = HFStreamDataset(
             dataset_name = dataset_name,
@@ -454,7 +460,8 @@ def from_hf(dataset_name: str, tokenizer: BaseTokenizer, cfg: DataConfig,
             bos_id       = bos_id,
             eos_id       = eos_id,
             skip_rows    = 0,
-            take_rows    = val_n,               # fixed val window
+            take_rows    = val_n,
+            config       = config,
         )
 
         # restore counters onto train_ds (rows_seen is already set via skip_rows above)

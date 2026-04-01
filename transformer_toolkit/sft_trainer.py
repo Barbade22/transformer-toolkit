@@ -291,4 +291,5 @@ class SFTTrainer(Trainer):
 
     def _load(self, path: str) -> tuple[int, float]:
         from .trainer import load_ckpt
-        return load_ckpt(path, self.model, self.optimizer, self.scaler)
+        step, val_loss, _ = load_ckpt(path, self.model, self.optimizer, self.scaler)
+        return step, val_loss

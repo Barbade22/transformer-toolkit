@@ -160,21 +160,34 @@ def load_ckpt(path: str, model, optimizer=None, scaler=None):
     stream_state is None for checkpoints saved without streaming.
     """
     ckpt = torch.load(path, map_location="cpu", weights_only=False)
-    if hasattr(model, "load_state_dict_with_tie"):
-        model.load_state_dict_with_tie(ckpt["model"])
-    else:
-        model.load_state_dict(ckpt["model"])
-    if optimizer: optimizer.load_state_dict(ckpt["optimizer"])
-    if scaler:    scaler.load_state_dict(ckpt["scaler"])
 
-    stream_state = ckpt.get("stream_state")   # None for old checkpoints
-    print(f"  {C.GREEN}▶  resumed from step {ckpt['step']}{C.RESET}  "
-          f"best_loss={ckpt['val_loss']:.4f}")
+    # support both old HF hub format ("model_state_dict") and trainer format ("model")
+    model_sd = ckpt.get("model") or ckpt.get("model_state_dict")
+    if model_sd is None:
+        raise KeyError("checkpoint has neither 'model' nor 'model_state_dict' key")
+    if hasattr(model, "load_state_dict_with_tie"):
+        model.load_state_dict_with_tie(model_sd)
+    else:
+        model.load_state_dict(model_sd)
+
+    # optimizer/scaler may be absent in inference-only HF checkpoints
+    opt_sd = ckpt.get("optimizer") or ckpt.get("optimizer_state_dict")
+    if optimizer and opt_sd:
+        optimizer.load_state_dict(opt_sd)
+
+    scaler_sd = ckpt.get("scaler") or ckpt.get("scaler_state_dict")
+    if scaler and scaler_sd:
+        scaler.load_state_dict(scaler_sd)
+
+    stream_state = ckpt.get("stream_state")
+    step         = ckpt.get("step", 0)
+    val_loss     = ckpt.get("val_loss", float("inf"))
+    print(f"  {C.GREEN}▶  resumed from step {step}{C.RESET}  best_loss={val_loss:.4f}")
     if stream_state is not None:
         rows = stream_state.get("rows_seen", 0)
         print(f"  {C.DIM}stream position: row {rows:,}{C.RESET}")
     print()
-    return ckpt["step"], ckpt["val_loss"], stream_state
+    return step, val_loss, stream_state
 
 
 # ─── eval ─────────────────────────────────────────────────────────────────────
