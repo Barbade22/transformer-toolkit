@@ -1,10 +1,9 @@
 # Transformer-Toolkit
 
 <p align="center">
-  <video width="600" controls>
-    <source src="https://raw.githubusercontent.com/Barbade22/transformer-toolkit/main/images/video.mp4" type="video/mp4">
-    Your browser does not support the video tag.
-  </video>
+  <a href="https://www.youtube.com/watch?v=04D5sN5pWUw">
+    <img src="https://img.youtube.com/vi/04D5sN5pWUw/0.jpg" width="600">
+  </a>
 </p>
 
 <p align="center">
