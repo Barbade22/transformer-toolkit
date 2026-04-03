@@ -4,7 +4,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from dataclasses import dataclass
-from typing import Literal
+from typing import Literal, Optional
 
 from .attention            import MultiHeadAttention, GroupedQueryAttention, \
                                   MultiQueryAttention, FlashAttention, MLAttention
@@ -62,7 +62,10 @@ class TransformerConfig:
     dropout:    float = 0.0
 
     # output
-    tie_weights: bool = True
+    tie_weights:   bool = True
+
+    # inference
+    use_kv_cache:  bool = False   # enable KV cache in generate() — inference only
 
     def __post_init__(self):
         if self.hidden_dim is None:
@@ -179,11 +182,6 @@ class Transformer(nn.Module):
         self.embed    = nn.Embedding(cfg.vocab_size, cfg.dim)
         self.emb_drop = nn.Dropout(cfg.dropout)
 
-        # RoPE stored as plain Python attribute — not a registered submodule.
-        # Registering it would cause its buffers to appear twice in state_dict
-        # (once here, once inside each attention block that holds a reference).
-        # ALiBi / SinusoidalPE / LearnedPE registered normally — they have
-        # parameters or persistent buffers that must survive save/load.
         _pe = _build_pos_enc(cfg)
         if isinstance(_pe, RoPE):
             self.__dict__['pos_enc'] = _pe
@@ -196,7 +194,7 @@ class Transformer(nn.Module):
                 n_heads = cfg.n_heads,
                 hidden  = cfg.hidden_dim,
                 norm    = _build_norm(cfg),
-                attn    = _build_attn(cfg, _pe),   # use _pe directly, not self.pos_enc
+                attn    = _build_attn(cfg, _pe),
                 ffn     = _build_ffn(cfg),
                 dropout = cfg.dropout,
             )
@@ -213,13 +211,23 @@ class Transformer(nn.Module):
 
     # ── forward ───────────────────────────────────────────────────────────────
 
-    def forward(self, tokens: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def forward(
+        self,
+        tokens:    torch.Tensor,
+        past_kvs:  Optional[list] = None,   # list of per-layer past_kv, or None
+    ) -> tuple[torch.Tensor, torch.Tensor, Optional[list]]:
         """
-        Returns (logits, aux_loss).
-        aux_loss is non-zero only for MoE FFN — add to training loss:
-            loss = ce_loss + aux_loss
-        For non-MoE models aux_loss is 0.0 and has no effect.
+        Returns (logits, aux_loss, present_kvs).
+
+        past_kvs:     None (training / no cache) or list of length n_layers.
+                      Each element is the past_kv tuple returned by the
+                      corresponding attention module on the previous step.
+        present_kvs:  Updated cache list, same length as n_layers.
+                      None when cfg.use_kv_cache is False.
+
+        aux_loss is non-zero only for MoE FFN variants.
         """
+        use_cache = self.cfg.use_kv_cache
         D = self.debug
         w = 62
 
@@ -234,13 +242,11 @@ class Transformer(nn.Module):
         if D:
             print(f"  {_C.DIM}embed   {_C.RESET} {_fmt(x)}")
 
-        # stream encodings applied once to x
         if isinstance(self.pos_enc, (SinusoidalPE, LearnedPE)):
             x = self.pos_enc(x)
             if D:
                 print(f"  {_C.DIM}pos_enc {_C.RESET} {_fmt(x)}  ({type(self.pos_enc).__name__})")
 
-        # ALiBi: compute bias once and pass to every block
         mask = None
         if isinstance(self.pos_enc, ALiBi):
             mask = self.pos_enc.get_bias(tokens.shape[1], tokens.device)
@@ -250,17 +256,26 @@ class Transformer(nn.Module):
         if D and isinstance(self.pos_enc, RoPE):
             print(f"  {_C.DIM}pos_enc {_C.RESET} RoPE — applied inside attention to q,k")
 
-        aux_loss = 0.0
+        aux_loss    = 0.0
+        present_kvs = [] if use_cache else None
+
         for i, block in enumerate(self.blocks):
-            x_in = x
-            x, block_aux = block(x, mask=mask)
+            past_kv = past_kvs[i] if (use_cache and past_kvs is not None) else None
+            x_in    = x
+
+            x, block_aux, present_kv = block(
+                x,
+                mask         = mask,
+                past_kv      = past_kv,
+                use_kv_cache = use_cache,
+            )
             aux_loss = aux_loss + block_aux
 
+            if use_cache:
+                present_kvs.append(present_kv)
+
             if D:
-                # residual stream stats
-                print(f"  {_C.DIM}block {i:<2}{_C.RESET}  in={_fmt(x_in)}  "
-                      f"out={_fmt(x)}")
-                # check residual update magnitude
+                print(f"  {_C.DIM}block {i:<2}{_C.RESET}  in={_fmt(x_in)}  out={_fmt(x)}")
                 delta = (x - x_in).float().norm().item()
                 x_norm = x_in.float().norm().item()
                 ratio = delta / (x_norm + 1e-8)
@@ -279,7 +294,6 @@ class Transformer(nn.Module):
         if D:
             print(f"  {_C.DIM}norm    {_C.RESET} {_fmt(normed)}")
             print(f"  {_C.DIM}logits  {_C.RESET} {_fmt(logits)}")
-            # logit entropy — high entropy = uniform = uncertain, low = peaked
             probs   = F.softmax(logits[:, -1, :].float(), dim=-1)
             entropy = -(probs * (probs + 1e-9).log()).sum(-1).mean().item()
             max_possible = torch.log(torch.tensor(self.cfg.vocab_size, dtype=torch.float)).item()
@@ -290,7 +304,7 @@ class Transformer(nn.Module):
                 print(f"  {_C.DIM}aux_loss{_C.RESET} {_C.CYAN}{aux_loss.item():.4f}{_C.RESET}")
             print(f"{_C.BOLD}{_C.MAGENTA}{'─'*w}{_C.RESET}\n")
 
-        return logits, aux_loss
+        return logits, aux_loss, present_kvs
 
     # ── generation ────────────────────────────────────────────────────────────
 
@@ -304,29 +318,67 @@ class Transformer(nn.Module):
     ) -> torch.Tensor:
         """
         Auto-regressive generation with top-k sampling.
+        Automatically uses KV cache when cfg.use_kv_cache=True.
+
+        With cache:    prefill full prompt once, then feed 1 token per step.
+        Without cache: re-run full context every step (original behaviour).
+
         top_k=1  → greedy decoding.
         top_k=0  → full-vocab softmax (not recommended).
         """
+        use_cache = self.cfg.use_kv_cache
+
+        if use_cache:
+            return self._generate_cached(tokens, max_new, temperature, top_k)
+        else:
+            return self._generate_nocache(tokens, max_new, temperature, top_k)
+
+    def _generate_nocache(self, tokens, max_new, temperature, top_k):
+        """Original behaviour — full context re-run every step."""
         for _ in range(max_new):
-            context     = tokens[:, -self.cfg.max_seq:]
-            logits, _   = self.forward(context)
-            logits      = logits[:, -1, :] / max(temperature, 1e-8)
-            if top_k > 0:
-                k      = min(top_k, logits.size(-1))
-                thresh = logits.topk(k, dim=-1).values[:, -1, None]
-                logits = logits.masked_fill(logits < thresh, float('-inf'))
-            probs  = F.softmax(logits, dim=-1)
-            tokens = torch.cat([tokens, torch.multinomial(probs, 1)], dim=-1)
+            context       = tokens[:, -self.cfg.max_seq:]
+            logits, _, __ = self.forward(context)
+            tokens        = self._sample(tokens, logits, temperature, top_k)
         return tokens
+
+    def _generate_cached(self, tokens, max_new, temperature, top_k):
+        """KV-cache generation — prefill once, then single-token steps."""
+        # ── prefill ───────────────────────────────────────────────────────────
+        context          = tokens[:, -self.cfg.max_seq:]
+        logits, _, kvs   = self.forward(context, past_kvs=None)
+        tokens           = self._sample(tokens, logits, temperature, top_k)
+
+        # ── decode loop ───────────────────────────────────────────────────────
+        for _ in range(max_new - 1):
+            # feed only the last token — K/V for all previous tokens are cached
+            last_token       = tokens[:, -1:]
+            logits, _, kvs   = self.forward(last_token, past_kvs=kvs)
+            tokens           = self._sample(tokens, logits, temperature, top_k)
+
+            # trim if we've exceeded max_seq
+            if tokens.shape[1] > self.cfg.max_seq:
+                tokens = tokens[:, -self.cfg.max_seq:]
+                # cache is now stale past max_seq — rebuild from scratch
+                # (rare edge case; a sliding-window cache is a future enhancement)
+                context        = tokens[:, :-1]
+                _, _, kvs      = self.forward(context, past_kvs=None)
+
+        return tokens
+
+    def _sample(self, tokens, logits, temperature, top_k):
+        """Sample next token and append to sequence."""
+        next_logits = logits[:, -1, :] / max(temperature, 1e-8)
+        if top_k > 0:
+            k      = min(top_k, next_logits.size(-1))
+            thresh = next_logits.topk(k, dim=-1).values[:, -1, None]
+            next_logits = next_logits.masked_fill(next_logits < thresh, float('-inf'))
+        probs  = F.softmax(next_logits, dim=-1)
+        return torch.cat([tokens, torch.multinomial(probs, 1)], dim=-1)
 
     # ── utilities ─────────────────────────────────────────────────────────────
 
     def to(self, *args, **kwargs):
         result = super().to(*args, **kwargs)
-        # RoPE is not a registered submodule so .to() does not move it
-        # automatically — move inv_freq to the new device and rebuild cache.
-        # inv_freq is always kept as float32 regardless of model dtype —
-        # frequency precision matters and bfloat16 has insufficient range.
         if isinstance(self.pos_enc, RoPE):
             device = next(self.parameters()).device
             self.pos_enc.inv_freq = self.pos_enc.inv_freq.to(
@@ -340,11 +392,6 @@ class Transformer(nn.Module):
         return f"{n/1e6:.2f}M" if n < 1e9 else f"{n/1e9:.2f}B"
 
     def debug_gradients(self):
-        """
-        Call after loss.backward() to inspect gradient health of every
-        named parameter. Flags vanishing (<1e-6 norm) and exploding (>10) grads.
-        Useful to run at step 1 and step 100 to confirm gradients are flowing.
-        """
         w = 62
         print(f"\n{_C.BOLD}{_C.BLUE}{'─'*w}{_C.RESET}")
         print(f"{_C.BOLD}{_C.BLUE}  📐 Gradient debug{_C.RESET}")
@@ -364,11 +411,6 @@ class Transformer(nn.Module):
         print(f"{_C.BOLD}{_C.BLUE}{'─'*w}{_C.RESET}\n")
 
     def debug_weights(self):
-        """
-        Print weight statistics for every parameter.
-        Useful at init to confirm parameters are well-scaled,
-        and after training to spot dead or saturated layers.
-        """
         w = 62
         print(f"\n{_C.BOLD}{_C.CYAN}{'─'*w}{_C.RESET}")
         print(f"{_C.BOLD}{_C.CYAN}  ⚖️  Weight debug{_C.RESET}")
@@ -378,7 +420,6 @@ class Transformer(nn.Module):
         print(f"{_C.BOLD}{_C.CYAN}{'─'*w}{_C.RESET}\n")
 
     def _print_model_summary(self):
-        """Printed once at construction when debug=True."""
         cfg = self.cfg
         w   = 62
         print(f"\n{_C.BOLD}{_C.CYAN}{'─'*w}{_C.RESET}")
@@ -386,20 +427,21 @@ class Transformer(nn.Module):
         print(f"{_C.BOLD}{_C.CYAN}{'─'*w}{_C.RESET}")
 
         rows = [
-            ("params",       self.n_params()),
-            ("vocab_size",   f"{cfg.vocab_size:,}"),
-            ("dim",          str(cfg.dim)),
-            ("n_layers",     str(cfg.n_layers)),
-            ("n_heads",      str(cfg.n_heads)),
-            ("head_dim",     str(cfg.head_dim)),
-            ("hidden_dim",   str(cfg.hidden_dim)),
-            ("attn",         cfg.attn),
-            ("ffn",          cfg.ffn),
-            ("norm",         cfg.norm),
-            ("pos_enc",      cfg.pos_enc),
-            ("dropout",      str(cfg.dropout)),
-            ("tie_weights",  str(cfg.tie_weights)),
-            ("max_seq",      str(cfg.max_seq)),
+            ("params",        self.n_params()),
+            ("vocab_size",    f"{cfg.vocab_size:,}"),
+            ("dim",           str(cfg.dim)),
+            ("n_layers",      str(cfg.n_layers)),
+            ("n_heads",       str(cfg.n_heads)),
+            ("head_dim",      str(cfg.head_dim)),
+            ("hidden_dim",    str(cfg.hidden_dim)),
+            ("attn",          cfg.attn),
+            ("ffn",           cfg.ffn),
+            ("norm",          cfg.norm),
+            ("pos_enc",       cfg.pos_enc),
+            ("dropout",       str(cfg.dropout)),
+            ("tie_weights",   str(cfg.tie_weights)),
+            ("max_seq",       str(cfg.max_seq)),
+            ("use_kv_cache",  str(cfg.use_kv_cache)),
         ]
         if cfg.attn == "gqa":
             rows.insert(6, ("n_kv_heads", str(cfg.n_kv_heads)))
@@ -413,7 +455,6 @@ class Transformer(nn.Module):
         for k, v in rows:
             print(f"  {_C.DIM}{k:<18}{_C.RESET} {_C.WHITE}{v}{_C.RESET}")
 
-        # parameter breakdown by component
         print(f"\n  {_C.DIM}parameter breakdown:{_C.RESET}")
         groups = {
             "embed":  self.embed,
@@ -424,9 +465,6 @@ class Transformer(nn.Module):
         total = sum(p.numel() for p in self.parameters())
         for gname, mod in groups.items():
             n = sum(p.numel() for p in mod.parameters())
-            # when tie_weights=True, head.weight is the same tensor as embed.weight
-            # — PyTorch deduplicates in self.parameters() but not in mod.parameters(),
-            # so subtract it here to avoid the bar chart summing over 100%
             if gname == "head" and cfg.tie_weights:
                 n = 0
             bar_w = 20
@@ -441,18 +479,12 @@ class Transformer(nn.Module):
     # ── checkpoint helpers ────────────────────────────────────────────────────
 
     def state_dict_for_save(self) -> dict:
-        """
-        Use instead of state_dict() when tie_weights=True.
-        Removes head.weight so load re-applies the tie instead of
-        breaking it into two independent tensors.
-        """
         sd = self.state_dict()
         if self.cfg.tie_weights:
             sd.pop("head.weight", None)
         return sd
 
     def load_state_dict_with_tie(self, sd: dict, strict: bool = True):
-        """Companion to state_dict_for_save(). Re-applies weight tying after load."""
         missing, unexpected = super().load_state_dict(sd, strict=False)
         expected_missing    = ["head.weight"] if self.cfg.tie_weights else []
         real_missing        = [k for k in missing if k not in expected_missing]

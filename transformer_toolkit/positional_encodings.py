@@ -70,18 +70,21 @@ class RoPE(nn.Module):
         self.register_buffer("cos_cache", emb.cos()[None, None], persistent=False)
         self.register_buffer("sin_cache", emb.sin()[None, None], persistent=False)
 
-    def rotate(self, q: torch.Tensor, k: torch.Tensor):
+    def rotate(self, q: torch.Tensor, k: torch.Tensor, offset: int = 0):
         """
         q, k: [B, n_heads, T, head_dim]
+        offset: number of tokens already in the KV cache (0 during training
+                or prefill, >0 during cached decode steps).
         Returns rotated (q, k) with identical shape.
         """
-        T = q.shape[2]
-        if T > self.cos_cache.shape[2]:
-            self._build_cache(T)
+        T   = q.shape[2]
+        end = offset + T
+        if end > self.cos_cache.shape[2]:
+            self._build_cache(end)
         # cast to q's dtype — cache is kept float32 for precision but q/k
         # may be bfloat16/float16 under mixed precision training
-        cos = self.cos_cache[:, :, :T, :].to(dtype=q.dtype)
-        sin = self.sin_cache[:, :, :T, :].to(dtype=q.dtype)
+        cos = self.cos_cache[:, :, offset:end, :].to(dtype=q.dtype)
+        sin = self.sin_cache[:, :, offset:end, :].to(dtype=q.dtype)
         return (
             q * cos + _rotate_half(q) * sin,
             k * cos + _rotate_half(k) * sin,

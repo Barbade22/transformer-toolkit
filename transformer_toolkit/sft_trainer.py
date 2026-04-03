@@ -94,7 +94,7 @@ def evaluate_sft(
         x, y, mask = x.to(device), y.to(device), mask.to(device)
 
         with autocast(device_type=device.type, dtype=dtype):
-            logits, _ = model(x)
+            logits, *_ = model(x)
             loss      = masked_cross_entropy(logits, y, mask, vocab_size)
 
         losses.append(loss.item())
@@ -131,6 +131,16 @@ class SFTTrainer(Trainer):
         model     = self.model
         optimizer = self.optimizer
         loader    = _infinite(self.train_dl)
+        steps_at_resume = step
+        if self.cfg.init_step == "current":
+            schedule_offset = step
+            print(f"  {C.DIM}lr schedule continuing from step {step}{C.RESET}")
+        elif isinstance(self.cfg.init_step, int):
+            schedule_offset = self.cfg.init_step
+            print(f"  {C.DIM}lr schedule offset to step {self.cfg.init_step}{C.RESET}")
+        else:
+            schedule_offset = 0
+            print(f"  {C.DIM}lr schedule restarting from step 0{C.RESET}")
 
         _header(cfg)
         model.train()
@@ -167,7 +177,7 @@ class SFTTrainer(Trainer):
                 sys.exit(0)
 
             # ── lr update ─────────────────────────────────────
-            lr = get_lr(step, cfg)
+            lr = get_lr(step - schedule_offset, cfg)
             for g in optimizer.param_groups:
                 g["lr"] = lr
 
@@ -191,7 +201,7 @@ class SFTTrainer(Trainer):
                               mask.to(self.device))
 
                 with autocast(device_type=self.device.type, dtype=self.dtype):
-                    logits, aux_loss = model(x)
+                    logits, aux_loss, *_ = model(x)
                     ce_loss = masked_cross_entropy(logits, y, mask, self.vocab_size)
                     loss    = (ce_loss + aux_loss) / cfg.grad_accum_steps
 
@@ -212,7 +222,7 @@ class SFTTrainer(Trainer):
             current_loss = accum_loss
             dt           = time.time() - t0
             tps          = tokens / max(dt, 1e-6)
-            eta          = (cfg.max_steps - step) * (time.time() - t_start) / max(step, 1)
+            eta = (cfg.max_steps - step) * (time.time() - t_start) / max(step - steps_at_resume, 1)
             eta_str      = f"{eta/60:.1f}m" if eta > 60 else f"{eta:.0f}s"
             lc           = _loss_color(current_loss)
             resp_pct     = 100.0 * accum_resp / max(x.numel() * cfg.grad_accum_steps, 1)

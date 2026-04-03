@@ -13,15 +13,13 @@ class TransformerBlock(nn.Module):
     Pre-norm transformer block: norm → attn → residual → norm → ffn → residual.
     Swap any component via attn=, ffn=, norm=.
 
-    forward() always returns (x, aux_loss).
-    aux_loss is non-zero only when an MoE FFN is used; the Transformer
-    accumulates it across layers and adds it to the training loss.
-    Non-MoE blocks always return aux_loss = tensor(0.0).
+    forward() always returns (x, aux_loss, present_kv).
+    aux_loss is non-zero only when an MoE FFN is used.
+    present_kv is None when use_kv_cache=False (training default).
 
     Gradient checkpointing is supported: set use_checkpoint=True to
-    trade compute for memory. Uses PyTorch's native checkpoint utility,
-    NOT the HuggingFace gradient_checkpointing_enable() method which
-    requires a HF model wrapper.
+    trade compute for memory. KV cache and gradient checkpointing are
+    mutually exclusive — checkpointing is a training-only feature.
     """
     def __init__(
         self,
@@ -35,13 +33,7 @@ class TransformerBlock(nn.Module):
         use_checkpoint:  bool  = False,
     ):
         super().__init__()
-        # Always two independent norm instances — never share the same object.
-        # The norm= argument is used only to determine the class and config;
-        # we instantiate fresh copies so norm1 and norm2 have separate parameters
-        # and accumulate gradients independently.
         if norm is not None:
-            # Re-instantiate from the passed norm's class and constructor args
-            # so callers can still inject RMSNorm/LayerNorm/etc. via norm=
             norm_cls    = type(norm)
             norm_kwargs = _norm_kwargs(norm)
             self.norm1  = norm_cls(**norm_kwargs)
@@ -56,22 +48,38 @@ class TransformerBlock(nn.Module):
         self.use_checkpoint = use_checkpoint
         self._is_moe        = hasattr(self.ffn, "aux_weight")
 
-    def forward(self, x: torch.Tensor, mask=None):
+    def forward(self, x: torch.Tensor, mask=None, past_kv=None, use_kv_cache: bool = False):
         if self.use_checkpoint:
-            # torch.utils.checkpoint with use_reentrant=False cannot handle
-            # None in the argument list — call _forward directly with mask=None
-            # or pass the mask as a tensor argument
+            # gradient checkpointing — no KV cache (training only)
             if mask is None:
-                return torch_checkpoint.checkpoint(
-                    self._forward, x, use_reentrant=False
+                x, aux_loss = torch_checkpoint.checkpoint(
+                    self._forward_no_cache, x, use_reentrant=False
                 )
-            return torch_checkpoint.checkpoint(
-                self._forward, x, mask, use_reentrant=False
-            )
-        return self._forward(x, mask)
+            else:
+                x, aux_loss = torch_checkpoint.checkpoint(
+                    self._forward_no_cache, x, mask, use_reentrant=False
+                )
+            return x, aux_loss, None
 
-    def _forward(self, x: torch.Tensor, mask=None):
-        x = x + self.drop(self.attn(self.norm1(x), mask))
+        return self._forward(x, mask=mask, past_kv=past_kv, use_kv_cache=use_kv_cache)
+
+    def _forward(self, x: torch.Tensor, mask=None, past_kv=None, use_kv_cache: bool = False):
+        attn_out, present_kv = self.attn(self.norm1(x), mask=mask, past_kv=past_kv)
+        x = x + self.drop(attn_out)
+
+        if self._is_moe:
+            ffn_out, aux_loss = self.ffn(self.norm2(x))
+        else:
+            ffn_out  = self.ffn(self.norm2(x))
+            aux_loss = 0.0
+
+        x = x + self.drop(ffn_out)
+        return x, aux_loss, present_kv if use_kv_cache else None
+
+    def _forward_no_cache(self, x: torch.Tensor, mask=None):
+        """Used by gradient checkpointing — no past_kv threading."""
+        attn_out, _ = self.attn(self.norm1(x), mask=mask)
+        x = x + self.drop(attn_out)
         if self._is_moe:
             ffn_out, aux_loss = self.ffn(self.norm2(x))
         else:
@@ -86,10 +94,8 @@ class TransformerBlock(nn.Module):
 def _norm_kwargs(norm: nn.Module) -> dict:
     """Extract constructor kwargs from a norm instance so we can re-instantiate it."""
     if hasattr(norm, "w") and hasattr(norm, "eps"):
-        # RMSNorm / LayerNorm as defined in normalization.py
         dim = norm.w.shape[0]
         return {"dim": dim, "eps": norm.eps}
-    # Fallback: try to read normalised_shape from nn.LayerNorm
     if hasattr(norm, "normalized_shape"):
         return {"dim": norm.normalized_shape[0],
                 "eps": getattr(norm, "eps", 1e-5)}

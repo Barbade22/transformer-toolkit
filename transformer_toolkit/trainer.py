@@ -110,6 +110,7 @@ class TrainConfig(BaseModel):
     hf_push_every_n:  bool          = Field(False, description="Push every save_every steps")
     hf_push_end:      bool          = Field(True,  description="Push at end of training")
     hf_push_on_pause: bool          = Field(True,  description="Push on Ctrl+C pause")
+    init_step: int | str = Field("current", description="LR schedule origin. 'current' continues from checkpoint step, 0 restarts warmup, or any int to offset schedule")
 
     class Config:
         validate_assignment = True
@@ -200,7 +201,7 @@ def evaluate(model, val_dl, vocab_size: int, device, cfg: TrainConfig) -> float:
     for x, y in val_dl:
         x, y = x.to(device), y.to(device)
         with autocast(device_type=device.type, dtype=dtype):
-            logits, _ = model(x)
+            logits, *_ = model(x)
             loss      = F.cross_entropy(logits.view(-1, vocab_size), y.view(-1))
         losses.append(loss.item())
         if len(losses) >= 20: break
@@ -273,7 +274,16 @@ class Trainer:
         model     = self.model
         optimizer = self.optimizer
         loader    = _infinite(self.train_dl)
-
+        steps_at_resume = step
+        if self.cfg.init_step == "current":
+            schedule_offset = step
+            print(f"  {C.DIM}lr schedule continuing from step {step}{C.RESET}")
+        elif isinstance(self.cfg.init_step, int):
+            schedule_offset = self.cfg.init_step
+            print(f"  {C.DIM}lr schedule offset to step {self.cfg.init_step}{C.RESET}")
+        else:
+            schedule_offset = 0
+            print(f"  {C.DIM}lr schedule restarting from step 0{C.RESET}")
         _header(cfg)
         model.train()
 
@@ -312,7 +322,7 @@ class Trainer:
                 sys.exit(0)
 
             # ── lr update ─────────────────────────────────────
-            lr = get_lr(step, cfg)
+            lr = get_lr(max(step - schedule_offset, 0), cfg)
             for g in optimizer.param_groups:
                 g["lr"] = lr
 
@@ -323,7 +333,7 @@ class Trainer:
                 x, y = next(loader)
                 x, y = x.to(self.device), y.to(self.device)
                 with autocast(device_type=self.device.type, dtype=self.dtype):
-                    logits, aux_loss = model(x)
+                    logits, aux_loss, *_ = model(x)
                     ce_loss  = F.cross_entropy(
                         logits.view(-1, self.vocab_size), y.view(-1)
                     )
@@ -343,7 +353,7 @@ class Trainer:
             current_loss = accum_loss
             dt           = time.time() - t0
             tps          = tokens / max(dt, 1e-6)
-            eta          = (cfg.max_steps - step) * (time.time() - t_start) / max(step, 1)
+            eta = (cfg.max_steps - step) * (time.time() - t_start) / max(step - steps_at_resume, 1)
             eta_str      = f"{eta/60:.1f}m" if eta > 60 else f"{eta:.0f}s"
             lc           = _loss_color(current_loss)
 
