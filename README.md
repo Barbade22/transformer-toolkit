@@ -2,6 +2,7 @@
 
 [▶ Watch Video](https://github.com/user-attachments/assets/2eba6d3e-5740-4aa8-ac9a-70e7f3abcd28)
 
+> **Music Credit**: Background music "Let's Go" by Elysium Audio Labs. See [MUSIC_CREDITS.md](MUSIC_CREDITS.md) for details.
 
 <p align="center">
   <a href="https://pypi.org/project/transformer-toolkit/"><img src="https://img.shields.io/pypi/v/transformer-toolkit?color=cyan&style=flat-square" alt="PyPI version"/></a>
