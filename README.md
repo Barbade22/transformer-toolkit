@@ -1584,10 +1584,10 @@ pip install torch torchvision torchaudio --index-url https://download.pytorch.or
 If you use Transformer-Toolkit in your research, please cite:
 
 ```bibtex
-@software{transformer_toolkit_2024,
+@software{transformer_toolkit_2026,
   title={Transformer-Toolkit: A Production Modular Transformer Library},
   author={Barbade, Govind},
-  year={2024},
+  year={2026},
   url={https://github.com/Barbade22/transformer-toolkit}
 }
 ```
