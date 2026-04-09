@@ -13,7 +13,7 @@ login(token="hf_Your-Hf token")
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"device: {DEVICE}")
 
-# ── tokenizer — train on TinyStories, not input.txt ──
+# ── tokenizer — train on Fineweb samples──
 TOK_PATH = "fine_tokenizer.json"
 tok = RustBPETokenizer()
 
@@ -52,7 +52,7 @@ hf_kwargs = dict(
 )
 train_dl, val_dl = from_hf(**hf_kwargs) 
 
-# ── model — 20M ──
+# ── model — 68M ──
 cfg_model = TransformerConfig(
     vocab_size  = tok.vocab_size,
     dim         = 512,
