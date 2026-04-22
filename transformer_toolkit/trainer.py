@@ -213,7 +213,7 @@ def evaluate(model, val_dl, vocab_size: int, device, cfg: TrainConfig) -> float:
 
 class Trainer:
     def __init__(self, model, train_dl, val_dl, vocab_size: int, cfg: TrainConfig,
-                 tokenizer=None, hf_kwargs: dict = None):
+                 tokenizer=None, hf_kwargs: dict = None, logger=None):
         self.model      = model
         self.train_dl   = train_dl
         self.val_dl     = val_dl
@@ -224,6 +224,7 @@ class Trainer:
         self.device     = next(model.parameters()).device
         self.dtype      = _dtype(cfg, self.device)
         self.best_loss  = float("inf")
+        self._rl = logger
 
         if cfg.grad_checkpoint:
             for block in model.blocks:
@@ -296,6 +297,9 @@ class Trainer:
         while step < cfg.max_steps:
 
             # ── pause check ───────────────────────────────────
+            if self._rl and self._rl.should_pause():
+                self._pause_req = True
+
             if self._pause_req:
                 path = f"{cfg.ckpt_dir}/pause_step_{step}.pt"
                 save_ckpt(path, model, optimizer, self.scaler, step, val_loss,
@@ -371,6 +375,16 @@ class Trainer:
                 end="", flush=True
             )
 
+            if self._rl:
+                self._rl.log(
+                    step           = step,
+                    train_loss     = accum_loss,
+                    lr             = lr,
+                    tokens_per_sec = tps,
+                    total_tokens   = total_tokens,
+                    eta_seconds    = eta,
+                )
+
             if step % cfg.log_every == 0:
                 # show tok/s + total tokens consumed
                 print(
@@ -406,8 +420,16 @@ class Trainer:
                             step      = step,
                             private   = cfg.hf_private,
                         )
-
                 _eval_line(step, val_loss, ppl, prev_best, saved)
+                if self._rl:
+                    self._rl.log_eval(
+                        step             = step,
+                        val_loss         = val_loss,
+                        ppl              = ppl,
+                        is_best          = saved,
+                        checkpoint_saved = saved,
+                        checkpoint_path  = f"{cfg.ckpt_dir}/best.pt" if saved else None,
+                    )
                 tokens = 0
                 t0     = time.time()
 
@@ -431,6 +453,8 @@ class Trainer:
 
         # ── end of training ───────────────────────────────────
         _done_line(self.best_loss, time.time() - t_start)
+        if self._rl:
+            self._rl.finish(status="completed")
 
         if self._hf and cfg.hf_push_end:
             self._hf.push(
