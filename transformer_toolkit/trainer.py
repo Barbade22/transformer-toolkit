@@ -267,9 +267,24 @@ class Trainer:
             # rebuild dataloader from scratch at the resumed stream position
             if stream_state is not None and self._hf_kwargs is not None:
                 from .dataloader import from_hf
-                self.train_dl, self.val_dl = from_hf(
-                    **self._hf_kwargs, _stream_state=stream_state
-                )
+                try:
+                    self.train_dl, self.val_dl = from_hf(
+                        **self._hf_kwargs, _stream_state=stream_state
+                    )
+                except Exception as e:
+                    if "10038" in str(e) or "Bad file descriptor" in str(e) or "socket" in str(e).lower() or "WinError" in str(e):
+                        print(f"  [resume] dead socket from pause, restarting stream...")
+                        time.sleep(3)
+                        try:
+                            self.train_dl, self.val_dl = from_hf(**self._hf_kwargs)
+                        except Exception as e2:
+                            # still failing — mark as paused and exit cleanly
+                            print(f"  [resume] stream restart failed: {e2}")
+                            if self._rl:
+                                self._rl.finish(status="paused")
+                            sys.exit(0)
+                    else:
+                        raise
 
         cfg       = self.cfg
         model     = self.model
@@ -305,7 +320,8 @@ class Trainer:
                 save_ckpt(path, model, optimizer, self.scaler, step, val_loss,
                           stream_state=self._stream_state())
                 _pause_line(step, path)
-
+                if self._rl:
+                    self._rl.finish(status="paused")  # ← add this
                 if self._hf and cfg.hf_repo and cfg.hf_push_on_pause:
                     print(f"  {C.YELLOW}⬆  pushing to hub before exit...{C.RESET}")
                     self._hf.push(
@@ -347,7 +363,7 @@ class Trainer:
                 tokens += x.numel()
 
             self.scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip).item()
             self.scaler.step(optimizer)
             self.scaler.update()
 
@@ -380,6 +396,7 @@ class Trainer:
                     step           = step,
                     train_loss     = accum_loss,
                     lr             = lr,
+                    grad_norm      = round(grad_norm, 4),
                     tokens_per_sec = tps,
                     total_tokens   = total_tokens,
                     eta_seconds    = eta,
