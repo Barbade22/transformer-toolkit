@@ -395,6 +395,7 @@ class Trainer:
                 self._rl.log(
                     step           = step,
                     train_loss     = accum_loss,
+                    total_steps    = cfg.max_steps,
                     lr             = lr,
                     grad_norm      = round(grad_norm, 4),
                     tokens_per_sec = tps,
