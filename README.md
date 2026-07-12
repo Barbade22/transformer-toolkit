@@ -26,6 +26,10 @@
 ```bash
 pip install transformer-toolkit
 ```
+or
+```bash
+pip install git+https://github.com/Barbade22/transformer-toolkit.git
+```
 
 ---
 
