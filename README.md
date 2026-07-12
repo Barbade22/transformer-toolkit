@@ -1,5 +1,16 @@
 # Transformer-Toolkit
 
+> ⚠️ **Notice**
+>
+> `pip install transformer-toolkit` is **no longer maintained**.
+>
+> Please install the latest version directly from GitHub:
+>
+> ```bash
+> pip install git+https://github.com/Barbade22/transformer-toolkit.git
+> ```
+---
+
 [▶ Watch Video](https://github.com/user-attachments/assets/96f4576b-6c90-4d31-b0cb-c528c8bb8b3b)
 
 > **Music Credit**: Background music "Let's Go" by Elysium Audio Labs. See [MUSIC_CREDITS.md](MUSIC_CREDITS.md) for details.
@@ -23,15 +34,6 @@
 - **Efficient dataloading**: Memmap-based dataset loading supports GB-scale datasets with zero RAM overhead
 - **Clear inference API**: Temperature, top-k, top-p, repetition penalty controls out-of-the-box
 
-```bash
-pip install transformer-toolkit
-```
-or
-```bash
-pip install git+https://github.com/Barbade22/transformer-toolkit.git
-```
-
----
 
 ## Table of Contents
 
