@@ -204,6 +204,9 @@ def evaluate(model, val_dl, vocab_size: int, device, cfg: TrainConfig) -> float:
             logits, *_ = model(x)
             loss      = F.cross_entropy(logits.view(-1, vocab_size), y.view(-1))
         losses.append(loss.item())
+        del logits, loss, x, y
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
         if len(losses) >= 20: break
     model.train()
     return sum(losses) / len(losses) if losses else float("inf")
@@ -226,6 +229,9 @@ class Trainer:
         self.best_loss  = float("inf")
         self._rl = logger
 
+        # Runtime knob override states
+        self._lr_multiplier = 1.0
+
         if cfg.grad_checkpoint:
             for block in model.blocks:
                 block.use_checkpoint = True
@@ -245,6 +251,16 @@ class Trainer:
             signal.signal(signal.SIGINT,  self._handle_pause)
             signal.signal(signal.SIGTERM, self._handle_pause)
 
+        # Register RunLogger knobs if logger is provided
+        if self._rl and hasattr(self._rl, 'register_knob'):
+            self._rl.register_knob("lr_multiplier", value=1.0, min=0.1, max=10.0)
+            self._rl.register_knob("eval_every", value=cfg.eval_every, min=10, max=5000)
+            self._rl.register_knob("grad_clip", value=cfg.grad_clip, min=0.0, max=10.0)
+            self._rl.register_knob("log_every", value=cfg.log_every, min=1, max=500)
+            self._rl.register_knob("weight_decay", value=cfg.weight_decay, min=0.0, max=1.0)
+            self._rl.register_knob("save_every", value=cfg.save_every, min=100, max=10000)
+            self._rl.register_knob("dropout", value=0.0, min=0.0, max=0.5)
+
     def _handle_pause(self, signum, frame):
         print(f"\n{C.YELLOW}  ⏸  pause requested — finishing step...{C.RESET}")
         self._pause_req = True
@@ -255,6 +271,16 @@ class Trainer:
         if hasattr(ds, "state_dict"):
             return ds.state_dict()
         return None
+
+    def _update_dropout(self, dropout_rate: float):
+        """Update dropout rate in model if supported."""
+        if hasattr(self.model, 'dropout'):
+            self.model.dropout = dropout_rate
+        # Try to update dropout in blocks if model has them
+        if hasattr(self.model, 'blocks'):
+            for block in self.model.blocks:
+                if hasattr(block, 'dropout'):
+                    block.dropout = dropout_rate
 
     def train(self, resume_from: str = None):
         step     = 0
@@ -309,123 +335,22 @@ class Trainer:
 
         print(f"  {C.DIM}starting...{C.RESET}  {_bar(0, cfg.max_steps)}  {C.DIM}step 0/{cfg.max_steps}{C.RESET}\n")
 
-        while step < cfg.max_steps:
+        try:
+            while step < cfg.max_steps:
 
-            # ── pause check ───────────────────────────────────
-            if self._rl and self._rl.should_pause():
-                self._pause_req = True
+                # ── pause check ───────────────────────────────────
+                if self._rl and self._rl.should_pause():
+                    self._pause_req = True
 
-            if self._pause_req:
-                path = f"{cfg.ckpt_dir}/pause_step_{step}.pt"
-                save_ckpt(path, model, optimizer, self.scaler, step, val_loss,
-                          stream_state=self._stream_state())
-                _pause_line(step, path)
-                if self._rl:
-                    self._rl.finish(status="paused")  # ← add this
-                if self._hf and cfg.hf_repo and cfg.hf_push_on_pause:
-                    print(f"  {C.YELLOW}⬆  pushing to hub before exit...{C.RESET}")
-                    self._hf.push(
-                        model     = model,
-                        optimizer = optimizer,
-                        scaler    = self.scaler,
-                        val_loss  = val_loss,
-                        repo_id   = cfg.hf_repo,
-                        cfg       = model.cfg,
-                        tokenizer = self.tokenizer,
-                        metrics   = {"val_loss": val_loss, "step": step},
-                        step      = step,
-                        private   = cfg.hf_private,
-                    )
-                    self._hf.wait()
-                    self._hf.shutdown()
-
-                sys.exit(0)
-
-            # ── lr update ─────────────────────────────────────
-            lr = get_lr(max(step - schedule_offset, 0), cfg)
-            for g in optimizer.param_groups:
-                g["lr"] = lr
-
-            # ── forward + backward ────────────────────────────
-            optimizer.zero_grad()
-            accum_loss = 0.0
-            for _ in range(cfg.grad_accum_steps):
-                x, y = next(loader)
-                x, y = x.to(self.device), y.to(self.device)
-                with autocast(device_type=self.device.type, dtype=self.dtype):
-                    logits, aux_loss, *_ = model(x)
-                    ce_loss  = F.cross_entropy(
-                        logits.view(-1, self.vocab_size), y.view(-1)
-                    )
-                    loss = (ce_loss + aux_loss) / cfg.grad_accum_steps
-                self.scaler.scale(loss).backward()
-                accum_loss += loss.item()
-                tokens += x.numel()
-
-            self.scaler.unscale_(optimizer)
-            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip).item()
-            self.scaler.step(optimizer)
-            self.scaler.update()
-
-            step += 1
-
-            # ── live progress bar ──────────────────────────────
-            current_loss = accum_loss
-            dt           = time.time() - t0
-            tps          = tokens / max(dt, 1e-6)
-            eta = (cfg.max_steps - step) * (time.time() - t_start) / max(step - steps_at_resume, 1)
-            eta_str      = f"{eta/60:.1f}m" if eta > 60 else f"{eta:.0f}s"
-            lc           = _loss_color(current_loss)
-
-            # tokens consumed so far (absolute, across all steps)
-            total_tokens = step * cfg.grad_accum_steps * self.train_dl.batch_size
-            if hasattr(self.train_dl.dataset, "seq_len"):
-                total_tokens *= self.train_dl.dataset.seq_len
-
-            print(
-                f"\r  {C.DIM}step{C.RESET} {C.BOLD}{C.WHITE}{step:>6}{C.RESET}/{cfg.max_steps}"
-                f"  {_bar(step, cfg.max_steps)}"
-                f"  {C.DIM}loss{C.RESET} {lc}{C.BOLD}{current_loss:.4f}{C.RESET}"
-                f"  {C.DIM}lr{C.RESET} {C.MAGENTA}{lr:.1e}{C.RESET}"
-                f"  {C.DIM}eta{C.RESET} {C.BLUE}{eta_str}{C.RESET}   ",
-                end="", flush=True
-            )
-
-            if self._rl:
-                self._rl.log(
-                    step           = step,
-                    train_loss     = accum_loss,
-                    total_steps    = cfg.max_steps,
-                    lr             = lr,
-                    grad_norm      = round(grad_norm, 4),
-                    tokens_per_sec = tps,
-                    total_tokens   = total_tokens,
-                    eta_seconds    = eta,
-                )
-
-            if step % cfg.log_every == 0:
-                # show tok/s + total tokens consumed
-                print(
-                    f"  {C.DIM}tok/s{C.RESET} {C.YELLOW}{tps:,.0f}{C.RESET}"
-                    f"  {C.DIM}total{C.RESET} {C.CYAN}{total_tokens:,}{C.RESET}"
-                )
-                tokens = 0
-                t0     = time.time()
-
-            # ── eval ──────────────────────────────────────────
-            if step % cfg.eval_every == 0:
-                val_loss  = evaluate(model, self.val_dl, self.vocab_size, self.device, cfg)
-                ppl       = math.exp(min(val_loss, 20))
-                saved     = val_loss < self.best_loss
-                prev_best = self.best_loss
-
-                if saved:
-                    self.best_loss = val_loss
-                    if cfg.save_best:
-                        save_ckpt(f"{cfg.ckpt_dir}/best.pt", model, optimizer, self.scaler,
-                                  step, val_loss, stream_state=self._stream_state())
-
-                    if self._hf and cfg.hf_push_best:
+                if self._pause_req:
+                    path = f"{cfg.ckpt_dir}/pause_step_{step}.pt"
+                    save_ckpt(path, model, optimizer, self.scaler, step, val_loss,
+                              stream_state=self._stream_state())
+                    _pause_line(step, path)
+                    if self._rl:
+                        self._rl.finish(status="paused")
+                    if self._hf and cfg.hf_repo and cfg.hf_push_on_pause:
+                        print(f"  {C.YELLOW}⬆  pushing to hub before exit...{C.RESET}")
                         self._hf.push(
                             model     = model,
                             optimizer = optimizer,
@@ -434,62 +359,192 @@ class Trainer:
                             repo_id   = cfg.hf_repo,
                             cfg       = model.cfg,
                             tokenizer = self.tokenizer,
-                            metrics   = {"val_loss": val_loss, "perplexity": ppl},
+                            metrics   = {"val_loss": val_loss, "step": step},
                             step      = step,
                             private   = cfg.hf_private,
                         )
-                _eval_line(step, val_loss, ppl, prev_best, saved)
+                        self._hf.wait()
+                        self._hf.shutdown()
+
+                    sys.exit(0)
+
+                # ── lr update (with multiplier steering support) ─────────
+                lr_multiplier = self._rl.knobs.get("lr_multiplier", 1.0) if self._rl else 1.0
+                self._lr_multiplier = lr_multiplier
+                scheduled_lr = get_lr(max(step - schedule_offset, 0), cfg)
+                lr = scheduled_lr * lr_multiplier
+                
+                # ── weight_decay knob support ─────────────────────────
+                weight_decay = self._rl.knobs.get("weight_decay", cfg.weight_decay) if self._rl else cfg.weight_decay
+                
+                # ── dropout knob support ─────────────────────────────
+                dropout = self._rl.knobs.get("dropout", 0.0) if self._rl else 0.0
+                self._update_dropout(dropout)
+                
+                for g in optimizer.param_groups:
+                    g["lr"] = lr
+                    g["weight_decay"] = weight_decay
+
+                # ── forward + backward ────────────────────────────
+                optimizer.zero_grad()
+                accum_loss = 0.0
+                for _ in range(cfg.grad_accum_steps):
+                    x, y = next(loader)
+                    x, y = x.to(self.device), y.to(self.device)
+                    with autocast(device_type=self.device.type, dtype=self.dtype):
+                        logits, aux_loss, *_ = model(x)
+                        ce_loss  = F.cross_entropy(
+                            logits.view(-1, self.vocab_size), y.view(-1)
+                        )
+                        loss = (ce_loss + aux_loss) / cfg.grad_accum_steps
+                    self.scaler.scale(loss).backward()
+                    accum_loss += loss.item()
+                    tokens += x.numel()
+
+                # ── grad_clip (with knob support) ───────────────────────
+                clip_val = self._rl.knobs.get("grad_clip", cfg.grad_clip) if self._rl else cfg.grad_clip
+                self.scaler.unscale_(optimizer)
+                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), clip_val).item()
+                self.scaler.step(optimizer)
+                self.scaler.update()
+
+                step += 1
+
+                # ── live progress bar ──────────────────────────────
+                current_loss = accum_loss
+                dt           = time.time() - t0
+                tps          = tokens / max(dt, 1e-6)
+                eta = (cfg.max_steps - step) * (time.time() - t_start) / max(step - steps_at_resume, 1)
+                eta_str      = f"{eta/60:.1f}m" if eta > 60 else f"{eta:.0f}s"
+                lc           = _loss_color(current_loss)
+
+                # tokens consumed so far (absolute, across all steps)
+                total_tokens = step * cfg.grad_accum_steps * self.train_dl.batch_size
+                if hasattr(self.train_dl.dataset, "seq_len"):
+                    total_tokens *= self.train_dl.dataset.seq_len
+
+                print(
+                    f"\r  {C.DIM}step{C.RESET} {C.BOLD}{C.WHITE}{step:>6}{C.RESET}/{cfg.max_steps}"
+                    f"  {_bar(step, cfg.max_steps)}"
+                    f"  {C.DIM}loss{C.RESET} {lc}{C.BOLD}{current_loss:.4f}{C.RESET}"
+                    f"  {C.DIM}lr{C.RESET} {C.MAGENTA}{lr:.1e}{C.RESET}"
+                    f"  {C.DIM}eta{C.RESET} {C.BLUE}{eta_str}{C.RESET}   ",
+                    end="", flush=True
+                )
+
                 if self._rl:
-                    self._rl.log_eval(
-                        step             = step,
-                        val_loss         = val_loss,
-                        ppl              = ppl,
-                        is_best          = saved,
-                        checkpoint_saved = saved,
-                        checkpoint_path  = f"{cfg.ckpt_dir}/best.pt" if saved else None,
-                    )
-                tokens = 0
-                t0     = time.time()
-
-            # ── step checkpoint ───────────────────────────────
-            if cfg.save_step_ckpts and step % cfg.save_every == 0:
-                save_ckpt(f"{cfg.ckpt_dir}/step_{step}.pt", model, optimizer, self.scaler,
-                          step, val_loss, stream_state=self._stream_state())
-
-                if self._hf and cfg.hf_push_every_n:
-                    self._hf.push(
-                        model     = model,
-                        optimizer = optimizer,
-                        scaler    = self.scaler,
-                        val_loss  = val_loss,
-                        repo_id   = cfg.hf_repo,
-                        cfg       = model.cfg,
-                        metrics   = {"val_loss": val_loss},
-                        step      = step,
-                        private   = cfg.hf_private,
+                    self._rl.log(
+                        step           = step,
+                        train_loss     = accum_loss,
+                        total_steps    = cfg.max_steps,
+                        lr             = lr,
+                        grad_norm      = round(grad_norm, 4),
+                        tokens_per_sec = tps,
+                        total_tokens   = total_tokens,
+                        eta_seconds    = eta,
                     )
 
-        # ── end of training ───────────────────────────────────
-        _done_line(self.best_loss, time.time() - t_start)
-        if self._rl:
-            self._rl.finish(status="completed")
+                # ── log_every (with knob support) ───────────────────────
+                log_every = int(self._rl.knobs.get("log_every", cfg.log_every)) if self._rl else cfg.log_every
+                if step % log_every == 0:
+                    # show tok/s + total tokens consumed
+                    print(
+                        f"  {C.DIM}tok/s{C.RESET} {C.YELLOW}{tps:,.0f}{C.RESET}"
+                        f"  {C.DIM}total{C.RESET} {C.CYAN}{total_tokens:,}{C.RESET}"
+                    )
+                    tokens = 0
+                    t0     = time.time()
 
-        if self._hf and cfg.hf_push_end:
-            self._hf.push(
-                model     = model,
-                optimizer = optimizer,
-                scaler    = self.scaler,
-                val_loss  = val_loss,
-                repo_id   = cfg.hf_repo,
-                cfg       = model.cfg,
-                tokenizer = self.tokenizer,
-                metrics   = {"val_loss": self.best_loss},
-                step      = step,
-                private   = cfg.hf_private,
-            )
+                # ── eval (with knob support) ────────────────────────────
+                eval_every = int(self._rl.knobs.get("eval_every", cfg.eval_every)) if self._rl else cfg.eval_every
+                if step % eval_every == 0:
+                    val_loss  = evaluate(model, self.val_dl, self.vocab_size, self.device, cfg)
+                    ppl       = math.exp(min(val_loss, 20))
+                    saved     = val_loss < self.best_loss
+                    prev_best = self.best_loss
 
-        if self._hf:
-            self._hf.shutdown()
+                    if saved:
+                        self.best_loss = val_loss
+                        if cfg.save_best:
+                            save_ckpt(f"{cfg.ckpt_dir}/best.pt", model, optimizer, self.scaler,
+                                      step, val_loss, stream_state=self._stream_state())
+
+                        if self._hf and cfg.hf_push_best:
+                            self._hf.push(
+                                model     = model,
+                                optimizer = optimizer,
+                                scaler    = self.scaler,
+                                val_loss  = val_loss,
+                                repo_id   = cfg.hf_repo,
+                                cfg       = model.cfg,
+                                tokenizer = self.tokenizer,
+                                metrics   = {"val_loss": val_loss, "perplexity": ppl},
+                                step      = step,
+                                private   = cfg.hf_private,
+                            )
+                    _eval_line(step, val_loss, ppl, prev_best, saved)
+                    if self._rl:
+                        self._rl.log_eval(
+                            step             = step,
+                            val_loss         = val_loss,
+                            ppl              = ppl,
+                            is_best          = saved,
+                            checkpoint_saved = saved,
+                            checkpoint_path  = f"{cfg.ckpt_dir}/best.pt" if saved else None,
+                        )
+                    tokens = 0
+                    t0     = time.time()
+
+                # ── step checkpoint (with knob support) ───────────────
+                save_every = int(self._rl.knobs.get("save_every", cfg.save_every)) if self._rl else cfg.save_every
+                if cfg.save_step_ckpts and step % save_every == 0:
+                    save_ckpt(f"{cfg.ckpt_dir}/step_{step}.pt", model, optimizer, self.scaler,
+                              step, val_loss, stream_state=self._stream_state())
+
+                    if self._hf and cfg.hf_push_every_n:
+                        self._hf.push(
+                            model     = model,
+                            optimizer = optimizer,
+                            scaler    = self.scaler,
+                            val_loss  = val_loss,
+                            repo_id   = cfg.hf_repo,
+                            cfg       = model.cfg,
+                            metrics   = {"val_loss": val_loss},
+                            step      = step,
+                            private   = cfg.hf_private,
+                        )
+
+            # ── end of training ───────────────────────────────────
+            _done_line(self.best_loss, time.time() - t_start)
+            if self._rl:
+                self._rl.finish(status="completed")
+
+            if self._hf and cfg.hf_push_end:
+                self._hf.push(
+                    model     = model,
+                    optimizer = optimizer,
+                    scaler    = self.scaler,
+                    val_loss  = val_loss,
+                    repo_id   = cfg.hf_repo,
+                    cfg       = model.cfg,
+                    tokenizer = self.tokenizer,
+                    metrics   = {"val_loss": self.best_loss},
+                    step      = step,
+                    private   = cfg.hf_private,
+                )
+
+            if self._hf:
+                self._hf.shutdown()
+
+        except KeyboardInterrupt:
+            if self._rl:
+                self._rl.finish(status="interrupted")
+            print(f"\n{C.YELLOW}  ⏸  training interrupted by user{C.RESET}")
+        except Exception as e:
+            if self._rl:
+                self._rl.finish(status="crashed")
+            print(f"\n{C.RED}  ✗ training crashed: {e}{C.RESET}")
+            raise
 
 
 # ─── helpers ──────────────────────────────────────────────────────────────────

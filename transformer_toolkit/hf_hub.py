@@ -169,11 +169,15 @@ class HFSyncWorker:
                 self._queue.task_done()
 
     def push(self, model: torch.nn.Module, optimizer=None, scaler=None, val_loss=None, **kwargs):
-        kwargs["model_state"] = copy.deepcopy(model.state_dict())
+        # Move state dicts to CPU before deepcopy to avoid GPU memory duplication
+        model_sd = {k: v.cpu() for k, v in model.state_dict().items()}
+        kwargs["model_state"] = copy.deepcopy(model_sd)
         if optimizer is not None:
-            kwargs["optimizer_state"] = copy.deepcopy(optimizer.state_dict())
+            opt_sd = {k: v.cpu() if isinstance(v, torch.Tensor) else v for k, v in optimizer.state_dict().items()}
+            kwargs["optimizer_state"] = copy.deepcopy(opt_sd)
         if scaler is not None:
-            kwargs["scaler_state"] = copy.deepcopy(scaler.state_dict())
+            scaler_sd = {k: v.cpu() if isinstance(v, torch.Tensor) else v for k, v in scaler.state_dict().items()}
+            kwargs["scaler_state"] = copy.deepcopy(scaler_sd)
         if val_loss is not None:
             kwargs["val_loss"] = val_loss
         self._queue.put(kwargs)
